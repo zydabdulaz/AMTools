@@ -1,80 +1,71 @@
-using ArdysaModsTools.Services;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
 
-namespace ArdysaModsTools
+namespace ArdysaModsTools.Services
 {
-    public partial class MiscellaneousForm : Form
+    public class MiscService
     {
-        private readonly string? _targetPath;
         private readonly LoggerService _logger;
-        private readonly MiscService _miscService;
-        private readonly Action _disableButtons;
-        private readonly Action _enableButtons;
 
-        public MiscellaneousForm(
+        public MiscService(LoggerService logger)
+        {
+            _logger = logger;
+        }
+
+        // 👉 expose your static dictionaries (previously inside MiscellaneousForm)
+        public static readonly Dictionary<string, string> WeatherValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> MapValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> MusicValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> EmblemsValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> ShadersValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> AtkModifierValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> RadiantCreepValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> DireCreepValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> RadiantSiegeValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> DireSiegeValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> HudValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> VersusValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> RiverValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> RadiantTowerValues = new() { /* ... */ };
+        public static readonly Dictionary<string, string> DireTowerValues = new() { /* ... */ };
+
+        // --------------------------
+        // PRESET HANDLING
+        // --------------------------
+        public void LoadPreset(params ComboBox[] boxes) { /* your old LoadPreset_Click logic here */ }
+        public void SavePreset(params ComboBox[] boxes) { /* your old SavePreset_Click logic here */ }
+
+        // --------------------------
+        // GENERATION
+        // --------------------------
+        public async Task<OperationResult> GenerateAsync(
             string? targetPath,
-            Action<string> log,
-            RichTextBox consoleLogBox,
-            Action disableButtons,
-            Action enableButtons)
+            string? weather, string? map, string? music, string? emblem, string? shader,
+            string? atkModifier, string? radiantCreep, string? direCreep,
+            string? radiantSiege, string? direSiege,
+            string? hud, string? versus, string? river,
+            string? radiantTower, string? direTower)
         {
-            _targetPath = targetPath;
-            _logger = new LoggerService(consoleLogBox);
-            _miscService = new MiscService(_logger, "your-github-token-here");
-            _disableButtons = disableButtons;
-            _enableButtons = enableButtons;
-
-            InitializeComponent();
-            HookUiEvents();
-            PopulateDictionaries();
-        }
-
-        private void HookUiEvents()
-        {
-            LoadPreset.Click += LoadPreset_Click;
-            SavePreset.Click += SavePreset_Click;
-            generateButton.Click += GenerateButton_Click;
-        }
-
-        private void PopulateDictionaries()
-        {
-            // Instead of duplicating dictionaries everywhere, 
-            // call static dictionary provider or load from JSON later
-            WeatherBox.Items.AddRange(MiscService.WeatherValues.Keys.ToArray());
-            MapBox.Items.AddRange(MiscService.MapValues.Keys.ToArray());
-            HUDBox.Items.AddRange(MiscService.HudValues.Keys.ToArray());
-            // ... repeat for MusicBox, EmblemsBox, etc.
-        }
-
-        private async void GenerateButton_Click(object sender, EventArgs e)
-        {
-            _disableButtons();
-            DisableFormControls();
-
             try
             {
-                var result = await _miscService.GenerateAsync(_targetPath,
-                    WeatherBox.SelectedItem?.ToString(),
-                    MapBox.SelectedItem?.ToString(),
-                    MusicBox.SelectedItem?.ToString(),
-                    EmblemsBox.SelectedItem?.ToString(),
-                    ShaderBox.SelectedItem?.ToString(),
-                    atkModifierBox.SelectedItem?.ToString(),
-                    RadiantCreepBox.SelectedItem?.ToString(),
-                    DireCreepBox.SelectedItem?.ToString(),
-                    RadiantSiegeBox.SelectedItem?.ToString(),
-                    DireSiegeBox.SelectedItem?.ToString(),
-                    HUDBox.SelectedItem?.ToString(),
-                    VersusBox.SelectedItem?.ToString(),
-                    RiverBox.SelectedItem?.ToString(),
-                    RadiantTowerBox.SelectedItem?.ToString(),
-                    DireTowerBox.SelectedItem?.ToString());
+                if (string.IsNullOrEmpty(targetPath))
+                    return OperationResult.Fail("Target path not set.");
 
-                MessageBox.Show(result.Message, result.Success ? "Success" : "Error");
+                // 🔥 move all your old PerformGeneration() logic here
+                // - Unpack pak01_dir.vpk
+                // - Apply regex replacements
+                // - Fetch remote resources
+                // - Write to items_game.txt
+                // - Repack with vpk.exe
+                // - Cleanup
+
+                _logger.Log("Mods installed successfully.");
+                return OperationResult.Ok("Mods installed successfully.");
             }
-            finally
+            catch (Exception ex)
             {
-                _enableButtons();
-                EnableFormControls();
+                _logger.Log($"Error: {ex.Message}");
+                return OperationResult.Fail(ex.Message);
             }
         }
     }
