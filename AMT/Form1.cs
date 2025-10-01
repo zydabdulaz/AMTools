@@ -1,5 +1,5 @@
-using AMTools.Core;
-using AMTools.Services;
+using ArdysaModsTools.Core;
+using ArdysaModsTools.Services;
 using System;
 using System.Drawing;
 using System.Windows.Forms;
@@ -9,32 +9,39 @@ namespace ArdysaModsTools
     public partial class Form1 : Form
     {
         private readonly ModToolManager _modManager;
+        private readonly LoggerService _logger;
 
         public Form1()
         {
             InitializeComponent();
 
-            // Setup dependencies
+            // --- Service setup ---
             var fileService = new FileService();
             var updateService = new UpdateService();
             var detectionService = new DetectionService();
-            var logger = new LoggerService(consoleLog); // now logs to UI textbox
+            _logger = new LoggerService(consoleLog);
 
-            _modManager = new ModToolManager(fileService, updateService, detectionService, logger, UpdateStatusUI);
+            // Pass UI update callback into manager
+            _modManager = new ModToolManager(fileService, updateService, detectionService, _logger, UpdateStatusUI, progressBar);
 
-            logger.Info("Ensure the 'game' folder is in the same directory as ArdysaModsTools.exe for installation to work!");
+            _logger.Info("Ensure the 'game' folder is in the same directory as ArdysaModsTools.exe for installation to work!");
 
-            // Initial status
+            // Initial UI state
             statusModsDotLabel.BackColor = Color.Gray;
             statusModsTextLabel.Text = "Not Checked";
             statusModsTextLabel.ForeColor = Color.Gray;
 
             EnableDetectionButtonsOnly();
-            _ = _modManager.CheckForUpdatesOnStartup();
+
+            // Auto check for updates
+            _ = _modManager.CheckForUpdatesOnStartupAsync();
         }
 
-        // --- UI Handlers ---
-        private async void autoDetectButton_Click(object sender, EventArgs e)
+        // -------------------
+        // UI Event Handlers
+        // -------------------
+
+        private async void AutoDetectButton_Click(object sender, EventArgs e)
         {
             DisableAllButtons();
             var result = await _modManager.AutoDetectAsync();
@@ -42,7 +49,7 @@ namespace ArdysaModsTools
             EnableAllButtons();
         }
 
-        private async void manualDetectButton_Click(object sender, EventArgs e)
+        private async void ManualDetectButton_Click(object sender, EventArgs e)
         {
             DisableAllButtons();
             var result = await _modManager.ManualDetectAsync();
@@ -50,7 +57,7 @@ namespace ArdysaModsTools
             EnableAllButtons();
         }
 
-        private async void installButton_Click(object sender, EventArgs e)
+        private async void InstallButton_Click(object sender, EventArgs e)
         {
             DisableAllButtons();
             var result = await _modManager.InstallModsAsync();
@@ -58,7 +65,7 @@ namespace ArdysaModsTools
             EnableAllButtons();
         }
 
-        private async void disableButton_Click(object sender, EventArgs e)
+        private async void DisableButton_Click(object sender, EventArgs e)
         {
             DisableAllButtons();
             var result = await _modManager.DisableModsAsync();
@@ -66,7 +73,7 @@ namespace ArdysaModsTools
             EnableAllButtons();
         }
 
-        private async void updatePatcherButton_Click(object sender, EventArgs e)
+        private async void UpdatePatcherButton_Click(object sender, EventArgs e)
         {
             DisableAllButtons();
             var result = await _modManager.UpdatePatcherAsync();
@@ -74,13 +81,36 @@ namespace ArdysaModsTools
             EnableAllButtons();
         }
 
-        private void miscellaneousButton_Click(object sender, EventArgs e)
+        private void MiscellaneousButton_Click(object sender, EventArgs e)
         {
-            using var miscForm = new MiscellaneousForm(_modManager.TargetPath, _modManager.Log);
+            using var miscForm = new MiscellaneousForm(_modManager.TargetPath, _logger.Log, consoleLog, DisableAllButtons, EnableAllButtons);
             miscForm.ShowDialog(this);
         }
 
-        // --- UI Helpers ---
+        private void DiscordPictureBox_Click(object sender, EventArgs e)
+        {
+            _modManager.OpenUrl("https://discord.gg/ffXw265Z7e", "Discord");
+        }
+
+        private void YoutubePictureBox_Click(object sender, EventArgs e)
+        {
+            _modManager.OpenUrl("https://youtube.com/@Ardysa", "YouTube");
+        }
+
+        private void PaypalPictureBox_Click(object sender, EventArgs e)
+        {
+            _modManager.OpenUrl("https://paypal.me/Ardysa", "PayPal");
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            _modManager.LoadSocialIcons(discordPictureBox, youtubePictureBox, paypalPictureBox);
+        }
+
+        // -------------------
+        // UI Helpers
+        // -------------------
+
         private void DisableAllButtons()
         {
             autoDetectButton.Enabled = manualDetectButton.Enabled =
@@ -102,7 +132,7 @@ namespace ArdysaModsTools
             updatePatcherButton.Enabled = miscellaneousButton.Enabled = true;
         }
 
-        // Updates status labels (called by ModToolManager via delegate)
+        // Update mods status label from manager
         private void UpdateStatusUI(string status, Color color)
         {
             BeginInvoke((Action)(() =>
@@ -112,5 +142,29 @@ namespace ArdysaModsTools
                 statusModsDotLabel.BackColor = color;
             }));
         }
+
+        // UI hover effects
+        private void Button_MouseEnter(object sender, EventArgs e)
+        {
+            if (sender is Button btn && btn.Enabled)
+            {
+                btn.BackColor = Color.FromArgb(0, 123, 255);
+                btn.ForeColor = Color.White;
+            }
+        }
+
+        private void Button_MouseLeave(object sender, EventArgs e)
+        {
+            if (sender is Button btn && btn.Enabled)
+            {
+                btn.BackColor = Color.FromArgb(58, 58, 58);
+                btn.ForeColor = Color.FromArgb(200, 200, 200);
+            }
+        }
+
+        private void label1_Click(object sender, EventArgs e) { }
+        private void label2_Click(object sender, EventArgs e) { }
+        private void button1_Click(object sender, EventArgs e) { }
+        private void progressBar_Click(object sender, EventArgs e) { }
     }
 }
