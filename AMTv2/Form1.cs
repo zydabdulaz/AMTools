@@ -34,6 +34,7 @@ namespace ArdysaModsTools
         public Form1()
         {
             InitializeComponent();
+            _logger = new Logger(consoleLog);
             Log("Ensure the 'game' folder is in the same directory as ArdysaModsTools.exe for installation to work!");
             httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
             httpClient.DefaultRequestHeaders.Add("Accept-Encoding", "gzip, deflate");
@@ -1275,3 +1276,4 @@ namespace ArdysaModsTools
     }
 
 }
+
