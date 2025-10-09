@@ -209,69 +209,6 @@ namespace ArdysaModsTools
             }
         }
 
-        private void Log(string message)
-        {
-            if (!IsHandleCreated)
-            {
-                // Buffer the message if the form isn't fully initialized
-                _logBuffer.Add(message);
-                return;
-            }
-
-            LogInternal(message);
-        }
-
-        private void LogInternal(string message)
-        {
-            if (consoleLog == null) return;
-
-            string timestamp = DateTime.Now.ToString("HH:mm");
-            string fullMessage = $"[{timestamp}] {message}\r\n";
-
-            BeginInvoke((Action)(() =>
-            {
-                int originalLength = consoleLog.TextLength;
-                consoleLog.AppendText(fullMessage);
-
-                int startIndex = Math.Max(0, originalLength);
-                consoleLog.SelectionStart = startIndex;
-                consoleLog.SelectionLength = fullMessage.Length;
-
-                if (message == "Ensure the 'game' folder is in the same directory as ArdysaModsTools.exe for installation to work!")
-                {
-                    consoleLog.SelectionColor = Color.FromArgb(255, 165, 0);
-                }
-                else if (message.Contains("Mods status: Ready"))
-                {
-                    int workingStartIndex = startIndex + $"[{timestamp}] Mods status: ".Length;
-                    consoleLog.SelectionStart = workingStartIndex;
-                    consoleLog.SelectionLength = "Ready".Length;
-                    consoleLog.SelectionColor = Color.FromArgb(0, 200, 0);
-                }
-                else if (message.Contains("Mods status: Need Update"))
-                {
-                    int notInstalledStartIndex = startIndex + $"[{timestamp}] Mods status: ".Length;
-                    consoleLog.SelectionStart = notInstalledStartIndex;
-                    consoleLog.SelectionLength = "Need Update".Length;
-                    consoleLog.SelectionColor = Color.FromArgb(255, 165, 0);
-                }
-                else if (message.Contains("Failed to check mods status"))
-                {
-                    int errorStartIndex = startIndex + $"[{timestamp}] ".Length;
-                    consoleLog.SelectionStart = errorStartIndex;
-                    consoleLog.SelectionLength = "Failed to check mods status".Length;
-                    consoleLog.SelectionColor = Color.FromArgb(255, 50, 50);
-                }
-                else
-                {
-                    consoleLog.SelectionColor = consoleLog.ForeColor;
-                }
-
-                consoleLog.SelectionStart = consoleLog.TextLength;
-                consoleLog.ScrollToCaret();
-            }));
-        }
-
         private void Button_MouseEnter(object? sender, EventArgs e)
         {
             if (sender is Button btn && btn.Enabled)
@@ -859,7 +796,7 @@ namespace ArdysaModsTools
             if (!File.Exists(vpkPath))
             {
                 Log($"Error: 'pak01_dir.vpk' not found at '{vpkPath}'.");
-                MessageBox.Show($"The 'pak01_dir.vpk' file is missing at '{vpkPath}'. Please ensure it’s included in the '_ArdysaMods' folder.", "Installation Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show($"The 'pak01_dir.vpk' file is missing at '{vpkPath}'. Please ensure itÂ’s included in the '_ArdysaMods' folder.", "Installation Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
 
@@ -956,7 +893,7 @@ namespace ArdysaModsTools
                 if (!Directory.Exists(sourceGamePath))
                 {
                     Log($"Error: 'game' folder not found at '{sourceGamePath}'.");
-                    MessageBox.Show($"The 'game' folder is missing at '{sourceGamePath}'. Please ensure it’s included with ArdysaModsTools.exe.", "Installation Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show($"The 'game' folder is missing at '{sourceGamePath}'. Please ensure itÂ’s included with ArdysaModsTools.exe.", "Installation Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     targetPath = null;
                     EnableDetectionButtonsOnly();
                     return;
@@ -1336,4 +1273,5 @@ namespace ArdysaModsTools
 
         private void progressBar_Click(object sender, EventArgs e) { }
     }
+
 }
