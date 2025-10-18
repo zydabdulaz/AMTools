@@ -21,8 +21,7 @@ namespace ArdysaModsTools.Core.Services
 
         private const string GitHubApiUrl = "https://api.github.com/repos/Anneardysa/ArdysaModsTools/releases/latest";
         public event Action<string>? OnVersionChanged;
-        public string CurrentVersion { get; private set; } = "1.9.7.4";
-
+        public string CurrentVersion { get; private set; }
 
         public UpdaterService(Logger logger)
         {
@@ -34,8 +33,16 @@ namespace ArdysaModsTools.Core.Services
             {
                 Timeout = TimeSpan.FromMinutes(10)
             };
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+
+            _httpClient.DefaultRequestHeaders.Add("User-Agent", "ArdysaModsTools-Updater");
+            _httpClient.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
+            _httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
+
+            // 🧠 Automatically detect version from the executable
+            var version = Application.ProductVersion; // from AssemblyInfo
+            CurrentVersion = string.IsNullOrEmpty(version) ? "1.0.0.0" : version;
         }
+
 
         public async Task CheckForUpdatesAsync()
         {
@@ -43,32 +50,23 @@ namespace ArdysaModsTools.Core.Services
             {
                 _logger.Log("Checking for updates...");
 
-                using var response = await _httpClient.GetAsync(GitHubApiUrl);
-                if (!response.IsSuccessStatusCode)
+                var release = await GetLatestReleaseAsync();
+                if (release == null)
                 {
-                    _logger.Log($"Failed to check for updates: {response.StatusCode}");
+                    _logger.Log("Unable to fetch update information.");
                     return;
                 }
 
-                var release = await NetworkHelper.GetLatestReleaseAsync(_httpClient, GitHubApiUrl);
-                if (release == null)
-                {
-                    _logger.Log("Failed to parse latest release info.");
-                    return;
-                }
-                string latestVersion = release.TagName;
-                string downloadUrl = release.DownloadUrl;
+                string latestVersion = release.Value.LatestVersion;
+                string downloadUrl = release.Value.DownloadUrl;
 
                 if (IsNewerVersion(latestVersion, CurrentVersion))
                 {
-                    _logger.Log($"New version {latestVersion} available (current: {CurrentVersion}).");
-
-                    // 🔸 Update internal version and notify listeners
-                    CurrentVersion = latestVersion;
-                    OnVersionChanged?.Invoke(CurrentVersion);
+                    _logger.Log($"Update available: v{latestVersion} → v{CurrentVersion}");
+                    OnVersionChanged?.Invoke(latestVersion);
 
                     var result = MessageBox.Show(
-                        $"A new version ({latestVersion}) is available. Would you like to update now?",
+                        $"A new version (v{latestVersion}) is available.\nDo you want to update now?",
                         "Update Available",
                         MessageBoxButtons.YesNo,
                         MessageBoxIcon.Information);
@@ -80,9 +78,7 @@ namespace ArdysaModsTools.Core.Services
                 }
                 else
                 {
-                    _logger.Log($"You are running the latest version ({CurrentVersion}).");
-
-                    // 🔸 Ensure label updates even if already latest
+                    _logger.Log($"Up to date (v{CurrentVersion})");
                     OnVersionChanged?.Invoke(CurrentVersion);
                 }
             }
@@ -91,6 +87,7 @@ namespace ArdysaModsTools.Core.Services
                 _logger.Log($"Update check failed: {ex.Message}");
             }
         }
+
 
         private bool IsNewerVersion(string latest, string current)
         {
@@ -107,6 +104,30 @@ namespace ArdysaModsTools.Core.Services
             }
 
             return false;
+        }
+        private async Task<(string LatestVersion, string DownloadUrl)?> GetLatestReleaseAsync()
+        {
+            try
+            {
+                var response = await _httpClient.GetAsync(GitHubApiUrl);
+                response.EnsureSuccessStatusCode();
+
+                using var stream = await response.Content.ReadAsStreamAsync();
+                using var doc = await JsonDocument.ParseAsync(stream);
+
+                string latestVersion = doc.RootElement.GetProperty("tag_name").GetString() ?? "v0.0.0";
+                string downloadUrl = doc.RootElement
+                    .GetProperty("assets")[0]
+                    .GetProperty("browser_download_url")
+                    .GetString() ?? string.Empty;
+
+                return (latestVersion.TrimStart('v'), downloadUrl);
+            }
+            catch (Exception ex)
+            {
+                _logger.Log($"Failed to retrieve release info: {ex.Message}");
+                return null;
+            }
         }
 
         private async Task DownloadAndApplyUpdateAsync(string downloadUrl)

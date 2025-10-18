@@ -10,21 +10,13 @@ using SharpCompress.Archives;
 using SharpCompress.Archives.Rar;
 using SharpCompress.Readers;
 using ArdysaModsTools.Core.Models;
+using ArdysaModsTools.Core.Helpers;
 
 namespace ArdysaModsTools.Core.Services
 {
-    /// <summary>
-    /// Handles mod generation: extracting VPK, patching assets, and repacking.
-    /// </summary>
-    /// <remarks>
-    /// Pure backend logic. The UI communicates through `Action<string> log`.
-    /// </remarks>
     public class MiscGenerationService
     {
-        // --- URL dictionaries (moved from form) ---
-        // Only keys are shown here: selection keys like "Weather", "Map", "Music", etc.
-        // Values are the URL resources used by the generation logic.
-        // (I copied your dictionaries; feel free to edit/trim/extend later.)
+        // --- Dictionaries (trimmed for brevity in this example) ---
         private readonly Dictionary<string, string> weatherValues = new()
         {
             { "Default Weather", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/main/models/root/Weather/Default.txt" },
@@ -194,17 +186,12 @@ namespace ArdysaModsTools.Core.Services
             { "The Gaze of Scree'Auk", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/refs/heads/main/models/root/Tower/Dire/The%20Gaze%20of%20Scree'Auk%20-%20Dire%20Towers.txt" }
         };
 
-        // Constructor - currently stateless but kept for future DI
+        // Single valid constructor
         public MiscGenerationService() { }
 
-        // -------------------------------------------------------
-        // Public API
-        // -------------------------------------------------------
-        /// <summary>
-        /// Perform generation using the provided selections. UI should pass user-selected values in `selections`.
-        /// Keys used by the service: "Weather","Map","Music","Emblem","Shader","AtkModifier",
-        /// "RadiantCreep","DireCreep","RadiantSiege","DireSiege","HUD","Versus","River","RadiantTower","DireTower"
-        /// </summary>
+        // ============================================================
+        // MAIN ENTRY POINT
+        // ============================================================
         public async Task<OperationResult> PerformGenerationAsync(
             string targetPath,
             Dictionary<string, string> selections,
@@ -216,660 +203,47 @@ namespace ArdysaModsTools.Core.Services
                 ct.ThrowIfCancellationRequested();
 
                 if (string.IsNullOrEmpty(targetPath))
-                {
-                    log("No target path set.");
-                    return new OperationResult { Success = false, Message = "No target path set." };
-                }
+                    return Fail("No target path set.", log);
 
-                string vpkPath = Path.Combine(targetPath, "game", "_ArdysaMods", "pak01_dir.vpk");
+                targetPath = PathUtility.NormalizeTargetPath(targetPath);
+                string vpkPath = PathUtility.GetVpkPath(targetPath);
                 if (!File.Exists(vpkPath))
-                {
-                    log($"VPK file not found at: {vpkPath}");
-                    return new OperationResult { Success = false, Message = "VPK file not found." };
-                }
+                    return Fail($"VPK file not found at: {vpkPath}", log);
 
-                string extractDir = Path.Combine(targetPath, "game", "_ArdysaMods", "extracted");
-                string hlExtractPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "HLExtract.exe");
-                string vpkToolPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "vpk.exe");
-
-                log("Checking Server tools...");
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string hlExtractPath = Path.Combine(baseDir, "HLExtract.exe");
+                string vpkToolPath = Path.Combine(baseDir, "vpk.exe");
                 if (!File.Exists(hlExtractPath) || !File.Exists(vpkToolPath))
-                {
-                    log("Server tools (HLExtract.exe or vpk.exe) not found.");
-                    return new OperationResult { Success = false, Message = "Server tools not found." };
-                }
+                    return Fail("Missing required tools (HLExtract.exe / vpk.exe).", log);
 
-                // Ensure a fresh extract directory
-                if (Directory.Exists(extractDir)) Directory.Delete(extractDir, true);
+                string tempRoot = Path.Combine(Path.GetTempPath(), $"ArdysaMods_{Guid.NewGuid():N}");
+                string extractDir = Path.Combine(tempRoot, "extract");
+                string buildDir = Path.Combine(tempRoot, "build");
                 Directory.CreateDirectory(extractDir);
+                Directory.CreateDirectory(buildDir);
 
-                // 1) Extract using HLExtract.exe (run process and wait)
-                log("Extracting VPK...");
-                var extractPsi = new ProcessStartInfo
-                {
-                    FileName = hlExtractPath,
-                    Arguments = $"-p \"{vpkPath}\" -d \"{extractDir}\" -e \"root\"",
-                    WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
+                if (!await Step_ExtractVpkAsync(hlExtractPath, vpkPath, extractDir, log, ct))
+                    return Fail("Extraction failed.", log);
 
-                await RunProcessAsync(extractPsi, log, ct);
+                if (!await Step_ModifyAsync(vpkPath, extractDir, selections, log, ct))
+                    return Fail("Modification failed.", log);
 
-                // Move contents from root folder if present
-                string? rootDir = Directory.GetDirectories(extractDir)
-                .FirstOrDefault(d => Path.GetFileName(d).Equals("root", StringComparison.OrdinalIgnoreCase));
+                string? newVpk = await Step_RecompileAsync(vpkToolPath, extractDir, buildDir, tempRoot, log, ct);
+                if (newVpk == null)
+                    return Fail("Recompile failed: no output.", log);
+                await Task.Delay(2000, ct);
+                if (!await Step_ReplaceAsync(targetPath, newVpk, log, ct))
+                    return Fail("Checking failed.", log);
 
-                if (rootDir != null)
-                {
-                    log("Organizing extracted files...");
-                    foreach (string file in Directory.GetFiles(rootDir, "*", SearchOption.AllDirectories))
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        string relativePath = Path.GetRelativePath(rootDir, file);
-                        string destFile = Path.Combine(extractDir, relativePath);
-                        Directory.CreateDirectory(Path.GetDirectoryName(destFile) ?? string.Empty);
-                        File.Move(file, destFile, true);
-                    }
-                    Directory.Delete(rootDir, true);
-                }
-                else
-                {
-                    log("No 'root' folder found after extract — maybe flat extraction layout.");
-                }
+                await Step_CleanupAsync(tempRoot, log, ct);
 
-                // Basic guard: ensure items_game exists
-                string itemsGamePath = Path.Combine(extractDir, "scripts", "items", "items_game.txt");
-                if (!File.Exists(itemsGamePath))
-                {
-                    log("core/dota items_game.txt not found.");
-                    return new OperationResult { Success = false, Message = "items_game.txt not found." };
-                }
-
-                // Read content for modification
-                string content = await File.ReadAllTextAsync(itemsGamePath, ct);
-
-                // Helper local function to get selection safely
-                string? GetSelection(string key)
-                {
-                    if (selections != null && selections.TryGetValue(key, out var val))
-                        return val;
-                    return null;
-                }
-
-                // Replacement routine examples: Weather, Map, Music, Creeps, Siege, Tower, HUD, Versus
-                // Each block: fetch remote content (if selection exists and map contains URL),
-                // then apply regex replacement if pattern exists.
-                ct.ThrowIfCancellationRequested();
-
-                // WEATHER
-                var selectedWeather = GetSelection("Weather");
-                if (selectedWeather != null && weatherValues.TryGetValue(selectedWeather, out var weatherUrl))
-                {
-                    log("Fetching Weather...");
-                    var weatherContent = await MiscUtilityService.GetStringWithRetryAsync(weatherUrl);
-                    if (!string.IsNullOrEmpty(weatherContent))
-                    {
-                        string weatherPattern = @"(?s)""555""\s*\{[^}]*""prefab""\s*""weather""[^}]*\}.*?(?=""556""|$)";
-                        if (Regex.IsMatch(content, weatherPattern))
-                        {
-                            content = Regex.Replace(content, weatherPattern, weatherContent);
-                            log("Weather applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // MAP / TERRAIN
-                var selectedMap = GetSelection("Map");
-                if (selectedMap != null && mapValues.TryGetValue(selectedMap, out var mapUrl))
-                {
-                    log("Fetching Terrain...");
-                    var mapContent = await MiscUtilityService.GetStringWithRetryAsync(mapUrl);
-                    if (!string.IsNullOrEmpty(mapContent))
-                    {
-                        string mapPattern = @"(?s)""590""\s*\{[^}]*""prefab""\s*""terrain""[^}]*\}.*?(?=""591""|$)";
-                        if (Regex.IsMatch(content, mapPattern))
-                        {
-                            content = Regex.Replace(content, mapPattern, mapContent);
-                            log("Terrain applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // MUSIC
-                var selectedMusic = GetSelection("Music");
-                if (selectedMusic != null && musicValues.TryGetValue(selectedMusic, out var musicUrl))
-                {
-                    log("Fetching Music...");
-                    var musicContent = await MiscUtilityService.GetStringWithRetryAsync(musicUrl);
-                    if (!string.IsNullOrEmpty(musicContent))
-                    {
-                        string musicPattern = @"(?s)""588""\s*\{[^}]*""prefab""\s*""music""[^}]*\}.*?(?=""589""|$)";
-                        if (Regex.IsMatch(content, musicPattern))
-                        {
-                            content = Regex.Replace(content, musicPattern, musicContent);
-                            log("Music applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // RADIANT / DIRE CREEPS
-                var selectedRadCreep = GetSelection("RadiantCreep");
-                if (selectedRadCreep != null && radiantCreepValues.TryGetValue(selectedRadCreep, out var radCreepUrl))
-                {
-                    log("Fetching Radiant Creeps...");
-                    var radContent = await MiscUtilityService.GetStringWithRetryAsync(radCreepUrl);
-                    if (!string.IsNullOrEmpty(radContent))
-                    {
-                        string radPattern = @"(?s)""660""\s*\{[^}]*""prefab""\s*""radiantcreeps""[^}]*\}.*?(?=""661""|$)";
-                        if (Regex.IsMatch(content, radPattern))
-                        {
-                            content = Regex.Replace(content, radPattern, radContent);
-                            log("Radiant creeps applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                var selectedDireCreep = GetSelection("DireCreep");
-                if (selectedDireCreep != null && direCreepValues.TryGetValue(selectedDireCreep, out var direCreepUrl))
-                {
-                    log("Fetching Dire Creeps...");
-                    var direContent = await MiscUtilityService.GetStringWithRetryAsync(direCreepUrl);
-                    if (!string.IsNullOrEmpty(direContent))
-                    {
-                        string direPattern = @"(?s)""661""\s*\{[^}]*""prefab""\s*""direcreeps""[^}]*\}.*?(?=""662""|$)";
-                        if (Regex.IsMatch(content, direPattern))
-                        {
-                            content = Regex.Replace(content, direPattern, direContent);
-                            log("Dire creeps applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // SIEGE
-                var selRadSiege = GetSelection("RadiantSiege");
-                if (selRadSiege != null && radiantSiegeValues.TryGetValue(selRadSiege, out var radSiegeUrl))
-                {
-                    log("Fetching Radiant Siege...");
-                    var radSiegeContent = await MiscUtilityService.GetStringWithRetryAsync(radSiegeUrl);
-                    if (!string.IsNullOrEmpty(radSiegeContent))
-                    {
-                        string radSiegePattern = @"(?s)""34462""\s*\{[^}]*""prefab""\s*""radiantsiegecreeps""[^}]*\}.*?(?=""34463""|$)";
-                        if (Regex.IsMatch(content, radSiegePattern))
-                        {
-                            content = Regex.Replace(content, radSiegePattern, radSiegeContent);
-                            log("Radiant siege applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                var selDireSiege = GetSelection("DireSiege");
-                if (selDireSiege != null && direSiegeValues.TryGetValue(selDireSiege, out var direSiegeUrl))
-                {
-                    log("Fetching Dire Siege...");
-                    var direSiegeContent = await MiscUtilityService.GetStringWithRetryAsync(direSiegeUrl);
-                    if (!string.IsNullOrEmpty(direSiegeContent))
-                    {
-                        string direSiegePattern = @"(?s)""34463""\s*\{[^}]*""prefab""\s*""diresiegecreeps""[^}]*\}.*?(?=""34925""|$)";
-                        if (Regex.IsMatch(content, direSiegePattern))
-                        {
-                            content = Regex.Replace(content, direSiegePattern, direSiegeContent);
-                            log("Dire siege applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // TOWERS
-                var selRadTower = GetSelection("RadiantTower");
-                if (selRadTower != null && radiantTowerValues.TryGetValue(selRadTower, out var radTowerUrl))
-                {
-                    log("Fetching Radiant Tower...");
-                    var radTowerContent = await MiscUtilityService.GetStringWithRetryAsync(radTowerUrl);
-                    if (!string.IsNullOrEmpty(radTowerContent))
-                    {
-                        string radTowerPattern = @"(?s)""677""\s*\{[^}]*""prefab""\s*""radianttowers""[^}]*\}.*?(?=""678""|$)";
-                        if (Regex.IsMatch(content, radTowerPattern))
-                        {
-                            content = Regex.Replace(content, radTowerPattern, radTowerContent);
-                            log("Radiant tower applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                var selDireTower = GetSelection("DireTower");
-                if (selDireTower != null && direTowerValues.TryGetValue(selDireTower, out var direTowerUrl))
-                {
-                    log("Fetching Dire Tower...");
-                    var direTowerContent = await MiscUtilityService.GetStringWithRetryAsync(direTowerUrl);
-                    if (!string.IsNullOrEmpty(direTowerContent))
-                    {
-                        string direTowerPattern = @"(?s)""678""\s*\{[^}]*""prefab""\s*""diretowers""[^}]*\}.*?(?=""679""|$)";
-                        if (Regex.IsMatch(content, direTowerPattern))
-                        {
-                            content = Regex.Replace(content, direTowerPattern, direTowerContent);
-                            log("Dire tower applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // HUD
-                var selHUD = GetSelection("HUD");
-                if (selHUD != null && hudValues.TryGetValue(selHUD, out var hudUrl))
-                {
-                    log("Fetching HUD...");
-                    var hudContent = await MiscUtilityService.GetStringWithRetryAsync(hudUrl);
-                    if (!string.IsNullOrEmpty(hudContent))
-                    {
-                        string hudPattern = @"(?s)""587""\s*\{[^}]*""prefab""\s*""hud_skin""[^}]*\}.*?(?=""588""|$)";
-                        if (Regex.IsMatch(content, hudPattern))
-                        {
-                            content = Regex.Replace(content, hudPattern, hudContent);
-                            log("HUD applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // VERSUS
-                var selVersus = GetSelection("Versus");
-                if (selVersus != null && versusValues.TryGetValue(selVersus, out var versusUrl))
-                {
-                    log("Fetching Versus Screen...");
-                    var versusContent = await MiscUtilityService.GetStringWithRetryAsync(versusUrl);
-                    if (!string.IsNullOrEmpty(versusContent))
-                    {
-                        string versusPattern = @"(?s)""12970""\s*\{[^}]*""prefab""\s*""versus_screen""[^}]*\}.*?(?=""12971""|$)";
-                        if (Regex.IsMatch(content, versusPattern))
-                        {
-                            content = Regex.Replace(content, versusPattern, versusContent);
-                            log("Versus applied.");
-                        }
-                    }
-                    await Task.Delay(1000, ct);
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // RIVER / VIAL handling (complex: delete or download + extract)
-                var selRiver = GetSelection("River");
-                if (selRiver != null && riverValues.TryGetValue(selRiver, out var riverUrl))
-                {
-                    var vpkDir = Path.GetDirectoryName(vpkPath);
-                    if (vpkDir == null)
-                    {
-                        log("Failed to determine VPK directory.");
-                        return new OperationResult { Success = false, Message = "VPK directory unknown." };
-                    }
-                    string tempDir = Path.Combine(vpkDir, "_temp");
-                    Directory.CreateDirectory(tempDir);
-
-                    if (selRiver == "Default Vial")
-                    {
-                        // attempt to read extraction.log and delete extracted files
-                        log("Disabling Vial...");
-                        string logExtraction = Path.Combine(tempDir, "extraction.log");
-                        if (File.Exists(logExtraction))
-                        {
-                            var lines = await File.ReadAllLinesAsync(logExtraction, ct);
-                            var filesToDelete = new HashSet<string>(lines.Select(l => l.Replace("Extracted: ", "")));
-                            if (Directory.Exists(extractDir))
-                            {
-                                foreach (var f in Directory.GetFiles(extractDir, "*", SearchOption.AllDirectories))
-                                {
-                                    ct.ThrowIfCancellationRequested();
-                                    var rel = Path.GetRelativePath(extractDir, f);
-                                    if (filesToDelete.Contains(rel))
-                                        File.Delete(f);
-                                }
-                                // cleanup empty directories
-                                foreach (var d in Directory.GetDirectories(extractDir, "*", SearchOption.AllDirectories).Reverse())
-                                {
-                                    if (!Directory.GetFiles(d, "*", SearchOption.AllDirectories).Any())
-                                        Directory.Delete(d, true);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        log("Fetching River Vial...");
-                        string rarFilePath = Path.Combine(tempDir, "riverVial.rar");
-                        using (var response = await MiscUtilityService.GetWithRetryAsync(riverUrl))
-                        {
-                            if (response == null)
-                            {
-                                log("River resource not found (404).");
-                                // continue (not fatal)
-                            }
-                            else
-                            {
-                                using var fs = new FileStream(rarFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
-                                await response.Content.CopyToAsync(fs, ct);
-                            }
-                        }
-
-                        await Task.Delay(1000, ct);
-
-                        // Extract with SharpCompress using password
-                        using (var archive = RarArchive.Open(rarFilePath, new ReaderOptions { Password = "muvestein@98" }))
-                        {
-                            var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
-                            if (!entries.Any())
-                            {
-                                File.Delete(rarFilePath);
-                                log("No valid files found in River Vial archive.");
-                                return new OperationResult { Success = false, Message = "Empty River archive." };
-                            }
-
-                            foreach (var entry in entries)
-                            {
-                                ct.ThrowIfCancellationRequested();
-                                if (string.IsNullOrEmpty(entry.Key)) continue;
-
-                                string destPath = Path.Combine(tempDir, entry.Key);
-                                Directory.CreateDirectory(Path.GetDirectoryName(destPath) ?? string.Empty);
-                                entry.WriteToFile(destPath);
-                                string logPath = Path.Combine(tempDir, "extraction.log");
-                                await File.AppendAllTextAsync(logPath, $"Extracted: {entry.Key}\n", ct);
-                            }
-                        }
-
-                        File.Delete(rarFilePath);
-
-                        // Copy extracted files to extractDir
-                        foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            var relativePath = Path.GetRelativePath(tempDir, file);
-                            if (Path.GetFileName(file) == "extraction.log") continue;
-                            var dest = Path.Combine(extractDir, relativePath);
-                            Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? string.Empty);
-                            File.Copy(file, dest, true);
-                        }
-
-                        // Create missing directories
-                        foreach (var dir in Directory.GetDirectories(tempDir, "*", SearchOption.AllDirectories))
-                        {
-                            var rel = Path.GetRelativePath(tempDir, dir);
-                            var destDir = Path.Combine(extractDir, rel);
-                            if (!Directory.Exists(destDir))
-                                Directory.CreateDirectory(destDir);
-                        }
-
-                        // Validate extraction minimally
-                        string extractedParticlesDir = Path.Combine(extractDir, "particles");
-                        if (!Directory.Exists(extractedParticlesDir))
-                        {
-                            log("Extraction failed or no valid River Vial folders found.");
-                            return new OperationResult { Success = false, Message = "River extraction failed." };
-                        }
-                        log("River Vial applied.");
-                    }
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // EMBLEMS (copy or delete)
-                var selEmblem = GetSelection("Emblem");
-                if (selEmblem != null && emblemsValues.TryGetValue(selEmblem, out var emblemUrl))
-                {
-                    string emblemDir = Path.Combine(extractDir, "particles", "ui_mouseactions");
-                    if (selEmblem == "Disable Emblem")
-                    {
-                        log("Disabling Emblems...");
-                        if (Directory.Exists(emblemDir))
-                            Directory.Delete(emblemDir, true);
-                    }
-                    else
-                    {
-                        Directory.CreateDirectory(emblemDir);
-                        log("Fetching Emblems...");
-                        var emblemFileName = Path.GetFileName(emblemUrl);
-                        var emblemDestPath = Path.Combine(emblemDir, emblemFileName);
-                        var emblemContent = await MiscUtilityService.GetByteArrayWithRetryAsync(emblemUrl);
-                        if (emblemContent != null)
-                        {
-                            await File.WriteAllBytesAsync(emblemDestPath, emblemContent, ct);
-                            log($"Emblem applied.");
-                        }
-                        await Task.Delay(1000, ct);
-                    }
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // SHADERS
-                var selShader = GetSelection("Shader");
-                if (selShader != null && shadersValues.TryGetValue(selShader, out var shaderUrl))
-                {
-                    string shaderDir = Path.Combine(extractDir, "materials", "dev");
-                    if (selShader == "Disable Shader")
-                    {
-                        log("Disabling Shaders...");
-                        if (Directory.Exists(shaderDir))
-                            Directory.Delete(shaderDir, true);
-                    }
-                    else
-                    {
-                        Directory.CreateDirectory(shaderDir);
-                        log("Fetching Shader...");
-                        var shaderFileName = Path.GetFileName(shaderUrl);
-                        var shaderDestPath = Path.Combine(shaderDir, shaderFileName);
-                        var shaderContent = await MiscUtilityService.GetByteArrayWithRetryAsync(shaderUrl);
-                        if (shaderContent != null)
-                        {
-                            await File.WriteAllBytesAsync(shaderDestPath, shaderContent, ct);
-                            log($"Shader applied.");
-                        }
-                        await Task.Delay(1000, ct);
-                    }
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // Write modified items game file back
-                await File.WriteAllTextAsync(itemsGamePath, content, ct);
-
-                ct.ThrowIfCancellationRequested();
-
-                // ATK MODIFIER (download/extract or disable)
-                var selAtk = GetSelection("AtkModifier");
-                if (selAtk != null && atkModifierValues.TryGetValue(selAtk, out var atkUrl))
-                {
-                    var vpkDir = Path.GetDirectoryName(vpkPath) ?? string.Empty;
-                    string tempDir = Path.Combine(vpkDir, "_temp");
-                    Directory.CreateDirectory(tempDir);
-
-                    if (selAtk == "Disable Attack Modifier")
-                    {
-                        log("Disabling Attack Modifier...");
-                        string logPath = Path.Combine(tempDir, "extraction.log");
-                        if (File.Exists(logPath))
-                        {
-                            var lines = await File.ReadAllLinesAsync(logPath, ct);
-                            var filesToDelete = new HashSet<string>(lines.Select(l => l.Replace("Extracted: ", "")));
-                            if (Directory.Exists(extractDir))
-                            {
-                                foreach (var f in Directory.GetFiles(extractDir, "*", SearchOption.AllDirectories))
-                                {
-                                    ct.ThrowIfCancellationRequested();
-                                    var rel = Path.GetRelativePath(extractDir, f);
-                                    if (filesToDelete.Contains(rel))
-                                        File.Delete(f);
-                                }
-
-                                // Clean up empty directories
-                                foreach (var d in Directory.GetDirectories(extractDir, "*", SearchOption.AllDirectories).Reverse())
-                                {
-                                    var rel = Path.GetRelativePath(extractDir, d);
-                                    if (filesToDelete.Contains(rel) && !Directory.GetFiles(d, "*", SearchOption.AllDirectories).Any())
-                                        Directory.Delete(d, true);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        log("Fetching Attack Modifier...");
-                        string rarFilePath = Path.Combine(tempDir, "atkModifier.rar");
-                        using (var response = await MiscUtilityService.GetWithRetryAsync(atkUrl))
-                        {
-                            if (response == null)
-                            {
-                                log("Attack modifier resource not found.");
-                            }
-                            else
-                            {
-                                using var fs = new FileStream(rarFilePath, FileMode.Create);
-                                await response.Content.CopyToAsync(fs, ct);
-                            }
-                        }
-
-                        await Task.Delay(1000, ct);
-
-                        using (var archive = RarArchive.Open(rarFilePath, new ReaderOptions { Password = "muvestein@98" }))
-                        {
-                            var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
-                            if (!entries.Any())
-                            {
-                                File.Delete(rarFilePath);
-                                log("No valid files found in atkModifier archive.");
-                            }
-                            else
-                            {
-                                foreach (var entry in entries)
-                                {
-                                    ct.ThrowIfCancellationRequested();
-                                    if (string.IsNullOrEmpty(entry.Key)) continue;
-                                    string destPath = Path.Combine(tempDir, entry.Key);
-                                    Directory.CreateDirectory(Path.GetDirectoryName(destPath) ?? string.Empty);
-                                    entry.WriteToFile(destPath);
-                                    string logPath = Path.Combine(tempDir, "extraction.log");
-                                    await File.AppendAllTextAsync(logPath, $"Extracted: {entry.Key}\n", ct);
-                                }
-                            }
-                        }
-
-                        File.Delete(rarFilePath);
-
-                        // Copy _temp -> extractDir
-                        foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            var rel = Path.GetRelativePath(tempDir, file);
-                            if (Path.GetFileName(file) == "extraction.log") continue;
-                            var dest = Path.Combine(extractDir, rel);
-                            Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? string.Empty);
-                            File.Copy(file, dest, true);
-                        }
-
-                        foreach (var dir in Directory.GetDirectories(tempDir, "*", SearchOption.AllDirectories))
-                        {
-                            var rel = Path.GetRelativePath(tempDir, dir);
-                            var destDir = Path.Combine(extractDir, rel);
-                            if (!Directory.Exists(destDir))
-                                Directory.CreateDirectory(destDir);
-                        }
-
-                        // Validate extraction
-                        string kisilevDir = Path.Combine(extractDir, "kisilev_ind", "particles", "modifier_attack");
-                        string particlesDir = Path.Combine(extractDir, "particles");
-                        if (!Directory.Exists(kisilevDir) && !Directory.Exists(particlesDir))
-                        {
-                            log("Extraction failed or no valid folders found for attack modifier.");
-                            return new OperationResult { Success = false, Message = "Attack modifier extraction failed." };
-                        }
-                        log("Attack Modifier applied.");
-                    }
-                }
-
-                ct.ThrowIfCancellationRequested();
-
-                // Inform user and pack with vpk.exe
-                log("Please wait... Do not close this app while processing.");
-                var packPsi = new ProcessStartInfo
-                {
-                    FileName = vpkToolPath,
-                    Arguments = $"\"{extractDir}\"",
-                    WorkingDirectory = Path.GetDirectoryName(vpkPath) ?? AppDomain.CurrentDomain.BaseDirectory,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                await RunProcessAsync(packPsi, log, ct);
-
-                // After pack, replace original vpk if temp found
-                var vpkDirectory = Path.GetDirectoryName(vpkPath) ?? string.Empty;
-                var tempVpk = Path.Combine(vpkDirectory, "extracted.vpk");
-                if (File.Exists(tempVpk))
-                {
-                    if (File.Exists(vpkPath)) File.Delete(vpkPath);
-                    File.Move(tempVpk, vpkPath);
-                    Directory.Delete(extractDir, true);
-
-                    // Clean up _temp except extraction.log
-                    string tempDir = Path.Combine(vpkDirectory, "_temp");
-                    if (Directory.Exists(tempDir))
-                    {
-                        foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
-                        {
-                            if (Path.GetFileName(file) != "extraction.log")
-                                File.Delete(file);
-                        }
-                        foreach (var dir in Directory.GetDirectories(tempDir, "*", SearchOption.AllDirectories).Reverse())
-                        {
-                            if (!Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Any())
-                                Directory.Delete(dir, true);
-                        }
-                        File.SetAttributes(tempDir, FileAttributes.Normal);
-                    }
-
-                    // Successful install — no need to double log here
-                    return new OperationResult { Success = true, Message = "Done! All mods applied successfully." };
-                }
-                else
-                {
-                    log($"Recompilation failed: {tempVpk} not found.");
-                    return new OperationResult { Success = false, Message = "Recompile failed: temp vpk missing." };
-                }
+                log("All mods successfully applied.");
+                return new OperationResult { Success = true, Message = "All mods successfully applied." };
             }
             catch (OperationCanceledException)
             {
                 log("Operation canceled.");
-                return new OperationResult { Success = false, Message = "Cancelled by user." };
+                return new OperationResult { Success = false, Message = "Canceled by user." };
             }
             catch (Exception ex)
             {
@@ -878,28 +252,843 @@ namespace ArdysaModsTools.Core.Services
             }
         }
 
-        /// <summary>
-        /// Runs an external process and logs its output.
-        /// </summary>
-        /// <param name="psi">ProcessStartInfo configuration.</param>
-        /// <param name="log">Logger delegate from UI.</param>
-        /// <param name="ct">Cancellation token for stopping the process.</param>
+        // ============================================================
+        // STEP 1 — Extract
+        // ============================================================
+        private async Task<bool> Step_ExtractVpkAsync(
+            string hlExtractPath, string vpkPath, string extractDir,
+            Action<string> log, CancellationToken ct)
+        {
+            log("Extracting..."); // Step 1
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = hlExtractPath,
+                Arguments = $"-p \"{vpkPath}\" -d \"{extractDir}\" -e \"root\"",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            await RunProcessAsync(psi, log, ct);
+
+            string rootDir = Path.Combine(extractDir, "root");
+            if (Directory.Exists(rootDir))
+            {
+                foreach (var file in Directory.GetFiles(rootDir, "*", SearchOption.AllDirectories))
+                {
+                    string relative = Path.GetRelativePath(rootDir, file);
+                    string dest = Path.Combine(extractDir, relative);
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                    File.Move(file, dest, true);
+                }
+                Directory.Delete(rootDir, true);
+            }
+
+            string itemsGamePath = Path.Combine(extractDir, "scripts", "items", "items_game.txt");
+            if (!File.Exists(itemsGamePath))
+            {
+                log("items_game.txt missing after extraction.");
+                return false;
+            }
+
+            log("Extraction completed.");
+            return true;
+        }
+
+        // ============================================================
+        // STEP 2 — Modify
+        // ============================================================
+        private async Task<bool> Step_ModifyAsync(
+            string vpkPath, string extractDir, Dictionary<string, string> selections,
+            Action<string> log, CancellationToken ct)
+        {
+            log("Applying modifications..."); //Step 2
+
+            string itemsGamePath = Path.Combine(extractDir, "scripts", "items", "items_game.txt");
+            if (!File.Exists(itemsGamePath))
+            {
+                log("items_game.txt not found.");
+                return false;
+            }
+
+            string content = await File.ReadAllTextAsync(itemsGamePath, ct);
+            string? GetSelection(string key) => selections != null && selections.TryGetValue(key, out var val) ? val : null;
+
+            // WEATHER
+            var selectedWeather = GetSelection("Weather");
+            if (selectedWeather != null && weatherValues.TryGetValue(selectedWeather, out var weatherUrl))
+            {
+                log("Fetching Weather...");
+                var weatherContent = await MiscUtilityService.GetStringWithRetryAsync(weatherUrl);
+                if (!string.IsNullOrEmpty(weatherContent))
+                {
+                    // Match exactly the block between "555" and the next quote-number ("556")
+                    string weatherPattern = @"(?s)""555""\s*\{.*?\}\s*(?=""556"")";
+
+                    // Test match existence first
+                    var match = Regex.Match(content, weatherPattern);
+                    if (match.Success)
+                    {
+                        content = Regex.Replace(content, weatherPattern, weatherContent, RegexOptions.Singleline);
+                        log("Weather applied.");
+                    }
+                    else
+                    {
+                        log("Weather pattern not found. Trying fallback...");
+
+                        // fallback — find any block with prefab "weather"
+                        string fallbackPattern = @"(?s)""\d+""\s*\{[^}]*""prefab""\s*""weather""[^}]*\}";
+
+                        if (Regex.IsMatch(content, fallbackPattern))
+                        {
+                            content = Regex.Replace(content, fallbackPattern, weatherContent, RegexOptions.Singleline);
+                            log("Weather applied (fallback).");
+                        }
+                        else
+                        {
+                            log("Weather block not found at all in items_game.txt");
+                        }
+                    }
+                }
+                else
+                {
+                    log("❌ Weather content empty or failed to fetch from URL.");
+                }
+
+                await Task.Delay(1000, ct);
+            }
+
+
+
+            ct.ThrowIfCancellationRequested();
+
+            // MAP / TERRAIN
+            var selectedMap = GetSelection("Map");
+            if (selectedMap != null && mapValues.TryGetValue(selectedMap, out var mapUrl))
+            {
+                log("Fetching Terrain...");
+                var mapContent = await MiscUtilityService.GetStringWithRetryAsync(mapUrl);
+                if (!string.IsNullOrEmpty(mapContent))
+                {
+                    string mapPattern = @"(?s)""590""\s*\{[^}]*""prefab""\s*""terrain""[^}]*\}.*?(?=""591""|$)";
+                    if (Regex.IsMatch(content, mapPattern))
+                    {
+                        content = Regex.Replace(content, mapPattern, mapContent);
+                        log("Terrain applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // MUSIC
+            var selectedMusic = GetSelection("Music");
+            if (selectedMusic != null && musicValues.TryGetValue(selectedMusic, out var musicUrl))
+            {
+                log("Fetching Music...");
+                var musicContent = await MiscUtilityService.GetStringWithRetryAsync(musicUrl);
+                if (!string.IsNullOrEmpty(musicContent))
+                {
+                    string musicPattern = @"(?s)""588""\s*\{[^}]*""prefab""\s*""music""[^}]*\}.*?(?=""589""|$)";
+                    if (Regex.IsMatch(content, musicPattern))
+                    {
+                        content = Regex.Replace(content, musicPattern, musicContent);
+                        log("Music applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // RADIANT / DIRE CREEPS
+            var selectedRadCreep = GetSelection("RadiantCreep");
+            if (selectedRadCreep != null && radiantCreepValues.TryGetValue(selectedRadCreep, out var radCreepUrl))
+            {
+                log("Fetching Radiant Creeps...");
+                var radContent = await MiscUtilityService.GetStringWithRetryAsync(radCreepUrl);
+                if (!string.IsNullOrEmpty(radContent))
+                {
+                    string radPattern = @"(?s)""660""\s*\{[^}]*""prefab""\s*""radiantcreeps""[^}]*\}.*?(?=""661""|$)";
+                    if (Regex.IsMatch(content, radPattern))
+                    {
+                        content = Regex.Replace(content, radPattern, radContent);
+                        log("Radiant creeps applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            var selectedDireCreep = GetSelection("DireCreep");
+            if (selectedDireCreep != null && direCreepValues.TryGetValue(selectedDireCreep, out var direCreepUrl))
+            {
+                log("Fetching Dire Creeps...");
+                var direContent = await MiscUtilityService.GetStringWithRetryAsync(direCreepUrl);
+                if (!string.IsNullOrEmpty(direContent))
+                {
+                    string direPattern = @"(?s)""661""\s*\{[^}]*""prefab""\s*""direcreeps""[^}]*\}.*?(?=""662""|$)";
+                    if (Regex.IsMatch(content, direPattern))
+                    {
+                        content = Regex.Replace(content, direPattern, direContent);
+                        log("Dire creeps applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // SIEGE
+            var selRadSiege = GetSelection("RadiantSiege");
+            if (selRadSiege != null && radiantSiegeValues.TryGetValue(selRadSiege, out var radSiegeUrl))
+            {
+                log("Fetching Radiant Siege...");
+                var radSiegeContent = await MiscUtilityService.GetStringWithRetryAsync(radSiegeUrl);
+                if (!string.IsNullOrEmpty(radSiegeContent))
+                {
+                    string radSiegePattern = @"(?s)""34462""\s*\{[^}]*""prefab""\s*""radiantsiegecreeps""[^}]*\}.*?(?=""34463""|$)";
+                    if (Regex.IsMatch(content, radSiegePattern))
+                    {
+                        content = Regex.Replace(content, radSiegePattern, radSiegeContent);
+                        log("Radiant siege applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            var selDireSiege = GetSelection("DireSiege");
+            if (selDireSiege != null && direSiegeValues.TryGetValue(selDireSiege, out var direSiegeUrl))
+            {
+                log("Fetching Dire Siege...");
+                var direSiegeContent = await MiscUtilityService.GetStringWithRetryAsync(direSiegeUrl);
+                if (!string.IsNullOrEmpty(direSiegeContent))
+                {
+                    string direSiegePattern = @"(?s)""34463""\s*\{[^}]*""prefab""\s*""diresiegecreeps""[^}]*\}.*?(?=""34925""|$)";
+                    if (Regex.IsMatch(content, direSiegePattern))
+                    {
+                        content = Regex.Replace(content, direSiegePattern, direSiegeContent);
+                        log("Dire siege applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // TOWERS
+            var selRadTower = GetSelection("RadiantTower");
+            if (selRadTower != null && radiantTowerValues.TryGetValue(selRadTower, out var radTowerUrl))
+            {
+                log("Fetching Radiant Tower...");
+                var radTowerContent = await MiscUtilityService.GetStringWithRetryAsync(radTowerUrl);
+                if (!string.IsNullOrEmpty(radTowerContent))
+                {
+                    string radTowerPattern = @"(?s)""677""\s*\{[^}]*""prefab""\s*""radianttowers""[^}]*\}.*?(?=""678""|$)";
+                    if (Regex.IsMatch(content, radTowerPattern))
+                    {
+                        content = Regex.Replace(content, radTowerPattern, radTowerContent);
+                        log("Radiant tower applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            var selDireTower = GetSelection("DireTower");
+            if (selDireTower != null && direTowerValues.TryGetValue(selDireTower, out var direTowerUrl))
+            {
+                log("Fetching Dire Tower...");
+                var direTowerContent = await MiscUtilityService.GetStringWithRetryAsync(direTowerUrl);
+                if (!string.IsNullOrEmpty(direTowerContent))
+                {
+                    string direTowerPattern = @"(?s)""678""\s*\{[^}]*""prefab""\s*""diretowers""[^}]*\}.*?(?=""679""|$)";
+                    if (Regex.IsMatch(content, direTowerPattern))
+                    {
+                        content = Regex.Replace(content, direTowerPattern, direTowerContent);
+                        log("Dire tower applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // HUD
+            var selHUD = GetSelection("HUD");
+            if (selHUD != null && hudValues.TryGetValue(selHUD, out var hudUrl))
+            {
+                log("Fetching HUD...");
+                var hudContent = await MiscUtilityService.GetStringWithRetryAsync(hudUrl);
+                if (!string.IsNullOrEmpty(hudContent))
+                {
+                    string hudPattern = @"(?s)""587""\s*\{[^}]*""prefab""\s*""hud_skin""[^}]*\}.*?(?=""588""|$)";
+                    if (Regex.IsMatch(content, hudPattern))
+                    {
+                        content = Regex.Replace(content, hudPattern, hudContent);
+                        log("HUD applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // VERSUS
+            var selVersus = GetSelection("Versus");
+            if (selVersus != null && versusValues.TryGetValue(selVersus, out var versusUrl))
+            {
+                log("Fetching Versus Screen...");
+                var versusContent = await MiscUtilityService.GetStringWithRetryAsync(versusUrl);
+                if (!string.IsNullOrEmpty(versusContent))
+                {
+                    string versusPattern = @"(?s)""12970""\s*\{[^}]*""prefab""\s*""versus_screen""[^}]*\}.*?(?=""12971""|$)";
+                    if (Regex.IsMatch(content, versusPattern))
+                    {
+                        content = Regex.Replace(content, versusPattern, versusContent);
+                        log("Versus applied.");
+                    }
+                }
+                await Task.Delay(1000, ct);
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // RIVER / VIAL handling (complex: delete or download + extract)
+            var selRiver = GetSelection("River");
+            if (selRiver != null && riverValues.TryGetValue(selRiver, out var riverUrl))
+            {
+                var vpkDir = Path.GetDirectoryName(vpkPath);
+                if (vpkDir == null)
+                {
+                    log("Failed to determine VPK directory.");
+                    return false;
+                }
+                string tempDir = Path.Combine(vpkDir, "_temp");
+                Directory.CreateDirectory(tempDir);
+
+                if (selRiver == "Default Vial")
+                {
+                    // attempt to read extraction.log and delete extracted files
+                    log("Disabling Vial...");
+                    string logExtraction = Path.Combine(tempDir, "extraction.log");
+                    if (File.Exists(logExtraction))
+                    {
+                        var lines = await File.ReadAllLinesAsync(logExtraction, ct);
+                        var filesToDelete = new HashSet<string>(lines.Select(l => l.Replace("Extracted: ", "")));
+                        if (Directory.Exists(extractDir))
+                        {
+                            foreach (var f in Directory.GetFiles(extractDir, "*", SearchOption.AllDirectories))
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                var rel = Path.GetRelativePath(extractDir, f);
+                                if (filesToDelete.Contains(rel))
+                                    File.Delete(f);
+                            }
+                            // cleanup empty directories
+                            foreach (var d in Directory.GetDirectories(extractDir, "*", SearchOption.AllDirectories).Reverse())
+                            {
+                                if (!Directory.GetFiles(d, "*", SearchOption.AllDirectories).Any())
+                                    Directory.Delete(d, true);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    log("Fetching River Vial...");
+                    string rarFilePath = Path.Combine(tempDir, "riverVial.rar");
+                    using (var response = await MiscUtilityService.GetWithRetryAsync(riverUrl))
+                    {
+                        if (response == null)
+                        {
+                            log("River resource not found (404).");
+                            // continue (not fatal)
+                        }
+                        else
+                        {
+                            using var fs = new FileStream(rarFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
+                            await response.Content.CopyToAsync(fs, ct);
+                        }
+                    }
+
+                    await Task.Delay(1000, ct);
+
+                    // Extract with SharpCompress using password
+                    using (var archive = RarArchive.Open(rarFilePath, new ReaderOptions { Password = "muvestein@98" }))
+                    {
+                        var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
+                        if (!entries.Any())
+                        {
+                            File.Delete(rarFilePath);
+                            log("No valid files found in River Vial archive.");
+                            return false;
+                        }
+
+                        foreach (var entry in entries)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            if (string.IsNullOrEmpty(entry.Key)) continue;
+
+                            string destPath = Path.Combine(tempDir, entry.Key);
+                            Directory.CreateDirectory(Path.GetDirectoryName(destPath) ?? string.Empty);
+                            entry.WriteToFile(destPath);
+                            string logPath = Path.Combine(tempDir, "extraction.log");
+                            await File.AppendAllTextAsync(logPath, $"Extracted: {entry.Key}\n", ct);
+                        }
+                    }
+
+                    File.Delete(rarFilePath);
+
+                    // Copy extracted files to extractDir
+                    foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var relativePath = Path.GetRelativePath(tempDir, file);
+                        if (Path.GetFileName(file) == "extraction.log") continue;
+                        var dest = Path.Combine(extractDir, relativePath);
+                        Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? string.Empty);
+                        File.Copy(file, dest, true);
+                    }
+
+                    // Create missing directories
+                    foreach (var dir in Directory.GetDirectories(tempDir, "*", SearchOption.AllDirectories))
+                    {
+                        var rel = Path.GetRelativePath(tempDir, dir);
+                        var destDir = Path.Combine(extractDir, rel);
+                        if (!Directory.Exists(destDir))
+                            Directory.CreateDirectory(destDir);
+                    }
+
+                    // Validate extraction minimally
+                    string extractedParticlesDir = Path.Combine(extractDir, "particles");
+                    if (!Directory.Exists(extractedParticlesDir))
+                    {
+                        log("Extraction failed or no valid River Vial folders found.");
+                        return false;
+                    }
+                    log("River Vial applied.");
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // EMBLEMS (copy or delete)
+            var selEmblem = GetSelection("Emblems");
+            if (selEmblem != null && emblemsValues.TryGetValue(selEmblem, out var emblemUrl))
+            {
+                string emblemDir = Path.Combine(extractDir, "particles", "ui_mouseactions");
+                if (selEmblem == "Disable Emblem")
+                {
+                    log("Disabling Emblems...");
+                    if (Directory.Exists(emblemDir))
+                        Directory.Delete(emblemDir, true);
+                }
+                else
+                {
+                    Directory.CreateDirectory(emblemDir);
+                    log("Fetching Emblems...");
+                    var emblemFileName = Path.GetFileName(emblemUrl);
+                    var emblemDestPath = Path.Combine(emblemDir, emblemFileName);
+                    var emblemContent = await MiscUtilityService.GetByteArrayWithRetryAsync(emblemUrl);
+                    if (emblemContent != null)
+                    {
+                        await File.WriteAllBytesAsync(emblemDestPath, emblemContent, ct);
+                        log($"Emblem applied.");
+                    }
+                    await Task.Delay(1000, ct);
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // SHADERS
+            var selShader = GetSelection("Shader");
+            if (selShader != null && shadersValues.TryGetValue(selShader, out var shaderUrl))
+            {
+                string shaderDir = Path.Combine(extractDir, "materials", "dev");
+                if (selShader == "Disable Shader")
+                {
+                    log("Disabling Shaders...");
+                    if (Directory.Exists(shaderDir))
+                        Directory.Delete(shaderDir, true);
+                }
+                else
+                {
+                    Directory.CreateDirectory(shaderDir);
+                    log("Fetching Shader...");
+                    var shaderFileName = Path.GetFileName(shaderUrl);
+                    var shaderDestPath = Path.Combine(shaderDir, shaderFileName);
+                    var shaderContent = await MiscUtilityService.GetByteArrayWithRetryAsync(shaderUrl);
+                    if (shaderContent != null)
+                    {
+                        await File.WriteAllBytesAsync(shaderDestPath, shaderContent, ct);
+                        log($"Shader applied.");
+                    }
+                    await Task.Delay(1000, ct);
+                }
+            }
+
+            ct.ThrowIfCancellationRequested();
+
+            // Write modified items game file back
+            await File.WriteAllTextAsync(itemsGamePath, content, ct);
+
+            ct.ThrowIfCancellationRequested();
+
+            // ATK MODIFIER (download/extract or disable)
+            var selAtk = GetSelection("AtkModifier");
+            if (selAtk != null && atkModifierValues.TryGetValue(selAtk, out var atkUrl))
+            {
+                var vpkDir = Path.GetDirectoryName(vpkPath) ?? string.Empty;
+                string tempDir = Path.Combine(vpkDir, "_temp");
+                Directory.CreateDirectory(tempDir);
+
+                if (selAtk == "Disable Attack Modifier")
+                {
+                    log("Disabling Attack Modifier...");
+                    string logPath = Path.Combine(tempDir, "extraction.log");
+                    if (File.Exists(logPath))
+                    {
+                        var lines = await File.ReadAllLinesAsync(logPath, ct);
+                        var filesToDelete = new HashSet<string>(lines.Select(l => l.Replace("Extracted: ", "")));
+                        if (Directory.Exists(extractDir))
+                        {
+                            foreach (var f in Directory.GetFiles(extractDir, "*", SearchOption.AllDirectories))
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                var rel = Path.GetRelativePath(extractDir, f);
+                                if (filesToDelete.Contains(rel))
+                                    File.Delete(f);
+                            }
+
+                            // Clean up empty directories
+                            foreach (var d in Directory.GetDirectories(extractDir, "*", SearchOption.AllDirectories).Reverse())
+                            {
+                                var rel = Path.GetRelativePath(extractDir, d);
+                                if (filesToDelete.Contains(rel) && !Directory.GetFiles(d, "*", SearchOption.AllDirectories).Any())
+                                    Directory.Delete(d, true);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    log("Fetching Attack Modifier...");
+                    string rarFilePath = Path.Combine(tempDir, "atkModifier.rar");
+                    using (var response = await MiscUtilityService.GetWithRetryAsync(atkUrl))
+                    {
+                        if (response == null)
+                        {
+                            log("Attack modifier resource not found.");
+                        }
+                        else
+                        {
+                            using var fs = new FileStream(rarFilePath, FileMode.Create);
+                            await response.Content.CopyToAsync(fs, ct);
+                        }
+                    }
+
+                    await Task.Delay(1000, ct);
+
+                    using (var archive = RarArchive.Open(rarFilePath, new ReaderOptions { Password = "muvestein@98" }))
+                    {
+                        var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
+                        if (!entries.Any())
+                        {
+                            File.Delete(rarFilePath);
+                            log("No valid files found in atkModifier archive.");
+                        }
+                        else
+                        {
+                            foreach (var entry in entries)
+                            {
+                                ct.ThrowIfCancellationRequested();
+                                if (string.IsNullOrEmpty(entry.Key)) continue;
+                                string destPath = Path.Combine(tempDir, entry.Key);
+                                Directory.CreateDirectory(Path.GetDirectoryName(destPath) ?? string.Empty);
+                                entry.WriteToFile(destPath);
+                                string logPath = Path.Combine(tempDir, "extraction.log");
+                                await File.AppendAllTextAsync(logPath, $"Extracted: {entry.Key}\n", ct);
+                            }
+                        }
+                    }
+
+                    File.Delete(rarFilePath);
+
+                    // Copy _temp -> extractDir
+                    foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var rel = Path.GetRelativePath(tempDir, file);
+                        if (Path.GetFileName(file) == "extraction.log") continue;
+                        var dest = Path.Combine(extractDir, rel);
+                        Directory.CreateDirectory(Path.GetDirectoryName(dest) ?? string.Empty);
+                        File.Copy(file, dest, true);
+                    }
+
+                    foreach (var dir in Directory.GetDirectories(tempDir, "*", SearchOption.AllDirectories))
+                    {
+                        var rel = Path.GetRelativePath(tempDir, dir);
+                        var destDir = Path.Combine(extractDir, rel);
+                        if (!Directory.Exists(destDir))
+                            Directory.CreateDirectory(destDir);
+                    }
+
+                    // Validate extraction
+                    string kisilevDir = Path.Combine(extractDir, "kisilev_ind", "particles", "modifier_attack");
+                    string particlesDir = Path.Combine(extractDir, "particles");
+                    if (!Directory.Exists(kisilevDir) && !Directory.Exists(particlesDir))
+                    {
+                        log("Extraction failed or no valid folders found for attack modifier.");
+                        return false;
+                    }
+                    log("Attack Modifier applied.");
+                }
+            }
+
+            await File.WriteAllTextAsync(itemsGamePath, content, ct);
+            log("Modification completed.");
+            return true;
+        }
+
+        // ============================================================
+        // STEP 3 — Recompile (clean logging version)
+        // ============================================================
+        private async Task<string?> Step_RecompileAsync(
+            string vpkToolPath, string extractDir, string buildDir, string tempRoot,
+            Action<string> log, CancellationToken ct)
+        {
+            log("Please wait... Do not close this App while processing");
+
+            if (string.IsNullOrWhiteSpace(vpkToolPath) || !File.Exists(vpkToolPath))
+            {
+                log("[Recompile] vpk.exe not found.");
+                return null;
+            }
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = vpkToolPath,
+                Arguments = $"\"{extractDir}\"",
+                WorkingDirectory = buildDir,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            var processOutput = new List<string>();
+            var startTime = DateTime.UtcNow;
+
+            try
+            {
+                log("Processing...");
+                await Task.Delay(3500, ct);
+                using (var proc = new Process { StartInfo = psi, EnableRaisingEvents = true })
+                {
+                    proc.OutputDataReceived += (s, e) => { if (e.Data != null) processOutput.Add(e.Data); };
+                    proc.ErrorDataReceived += (s, e) => { if (e.Data != null) processOutput.Add($"[ERR] {e.Data}"); };
+
+                    if (!proc.Start())
+                    {
+                        log("[Recompile] Failed to start vpk.exe process.");
+                        return null;
+                    }
+
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
+                    using (ct.Register(() =>
+                    {
+                        try { if (!proc.HasExited) proc.Kill(); } catch { }
+                    }))
+                    {
+                        await proc.WaitForExitAsync(ct);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"[Recompile] Error running vpk.exe: {ex.Message}");
+                return null;
+            }
+
+            if (processOutput.Count > 0)
+            {
+                foreach (var line in processOutput) ;
+            }
+            // Allow some filesystem delay for ultra-fast drives
+            await Task.Delay(3500, ct);
+
+            // Search for output file (Source 2: folder.vpk)
+            string? newVpk = null;
+            string parentDir = Path.GetDirectoryName(extractDir) ?? tempRoot;
+            string[] searchDirs = { buildDir, extractDir, parentDir, tempRoot };
+
+            for (int i = 0; i < 20 && newVpk == null; i++)
+            {
+                foreach (var dir in searchDirs.Where(Directory.Exists))
+                {
+                    var found = Directory.GetFiles(dir, "*.vpk", SearchOption.TopDirectoryOnly)
+                        .Where(f => File.GetCreationTimeUtc(f) >= startTime.AddSeconds(-5))
+                        .OrderByDescending(File.GetCreationTimeUtc)
+                        .FirstOrDefault();
+                    if (found != null)
+                    {
+                        newVpk = found;
+                        break;
+                    }
+                }
+
+                if (newVpk == null)
+                    await Task.Delay(3500, ct);
+            }
+
+            if (newVpk == null)
+            {
+                log("[Recompile] Failed — no output VPK found.");
+                return null;
+            }
+
+            await WaitForFileReady(newVpk, log, ct);
+            return newVpk;
+        }
+
+
+
+        // ============================================================
+        // STEP 4 — Replace (move compiled file to _ArdysaMods)
+        // ============================================================
+        private async Task<bool> Step_ReplaceAsync(
+            string targetPath,
+            string newVpkDirOrFile,
+            Action<string> log,
+            CancellationToken ct)
+        {
+
+            string modsDir = Path.Combine(targetPath, "game", "_ArdysaMods");
+            Directory.CreateDirectory(modsDir);
+
+            bool isFolder = Directory.Exists(newVpkDirOrFile);
+            string buildSource = isFolder ? newVpkDirOrFile : Path.GetDirectoryName(newVpkDirOrFile)!;
+            string tempRoot = Directory.GetParent(buildSource)?.FullName ?? buildSource;
+
+            string currentVpk = Path.Combine(modsDir, "pak01_dir.vpk");
+            string backupVpk = Path.Combine(modsDir, "old_pak01_dir.vpk");
+
+            // Backup old file
+            if (File.Exists(currentVpk))
+            {
+                File.Move(currentVpk, backupVpk, true);
+                await Task.Delay(3500, ct);
+            }
+
+            // Move compiled files
+            var vpkFiles = Directory.GetFiles(buildSource, "*.vpk", SearchOption.TopDirectoryOnly);
+            if (vpkFiles.Length == 0)
+            {
+                return false;
+            }
+
+            foreach (var file in vpkFiles)
+            {
+                string dest = Path.Combine(modsDir, Path.GetFileName(file));
+                File.Copy(file, dest, true);
+            }
+
+            string newPakPath = Path.Combine(modsDir, "pak01_dir.vpk");
+            string altPath = Path.Combine(modsDir, "extract.vpk");
+            if (!File.Exists(newPakPath) && File.Exists(altPath))
+            {
+                File.Move(altPath, newPakPath, true);
+            }
+
+            await WaitForFileReady(newPakPath, log, ct);
+            await Task.Delay(3500, ct);
+
+            if (File.Exists(newPakPath))
+            {
+                if (File.Exists(backupVpk)) File.Delete(backupVpk);
+            }
+            else
+            {
+                log("[Move] Failed — no new pak01_dir.vpk found.");
+                return false;
+            }
+
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                {
+                    Directory.Delete(tempRoot, true);
+                    log("[Move] Temporary files cleaned up.");
+                }
+            }
+            catch { }
+
+            return true;
+        }
+
+
+        // ============================================================
+        // STEP 5 — Cleanup
+        // ============================================================
+        private async Task Step_CleanupAsync(string tempRoot, Action<string> log, CancellationToken ct)
+        {
+            // Step 5: log("Cleaning up temporary files...");
+            try
+            {
+                await Task.Delay(300, ct);
+                if (Directory.Exists(tempRoot))
+                    Directory.Delete(tempRoot, true);
+                // Step 5: log("Cleanup complete.");
+            }
+            catch (Exception ex)
+            {
+                log($"Warning: {ex.Message}"); // Step 5: log($"Cleanup warning: {ex.Message}");
+            }
+        }
+
+        // ============================================================
+        // HELPERS
+        // ============================================================
         private static async Task RunProcessAsync(ProcessStartInfo psi, Action<string> log, CancellationToken ct)
         {
             using var proc = new Process { StartInfo = psi };
             proc.Start();
-            // Read both streams asynchronously to avoid deadlocks
-            var outputTask = proc.StandardOutput.ReadToEndAsync();
-            var errorTask = proc.StandardError.ReadToEndAsync();
+            await Task.WhenAll(proc.StandardOutput.ReadToEndAsync(), proc.StandardError.ReadToEndAsync());
+            await proc.WaitForExitAsync(ct);
+        }
 
-            await Task.WhenAll(outputTask, errorTask);
+        private static async Task WaitForFileReady(string path, Action<string> log, CancellationToken ct)
+        {
+            for (int i = 0; i < 30; i++)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                        return;
+                    }
+                }
+                catch (IOException) { }
+                await Task.Delay(300, ct);
+            }
+            log($"File not ready after timeout: {path}");
+        }
 
-            string outText = outputTask.Result;
-            string errText = errorTask.Result;
-            if (!string.IsNullOrEmpty(outText)) log("Process output...");
-            if (!string.IsNullOrEmpty(errText)) log("Process error...");
-
-            proc.WaitForExit();
+        private static OperationResult Fail(string msg, Action<string> log)
+        {
+            log(msg);
+            return new OperationResult { Success = false, Message = msg };
         }
     }
 }

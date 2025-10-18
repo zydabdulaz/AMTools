@@ -73,6 +73,7 @@ namespace ArdysaModsTools.Core.Services
             // --- Success ---
             if (message.Contains("done") ||
                 message.Contains("success") ||
+                message.Contains("completed") ||
                 message.Contains("ready") ||
                 message.Contains("installed successfully") ||
                 message.Contains("applied successfully"))
@@ -82,6 +83,7 @@ namespace ArdysaModsTools.Core.Services
             if (message.Contains("need update") ||
                 message.Contains("processing") ||
                 message.Contains("skipped") ||
+                message.Contains("please") ||
                 message.Contains("ensure") ||
                 message.Contains("maybe") ||
                 message.Contains("missing") ||

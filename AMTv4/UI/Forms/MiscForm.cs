@@ -140,7 +140,6 @@ namespace ArdysaModsTools
                 if (result.Success)
                 {
                     // Show only the final clean message
-                    _miscLogger.Log(result.Message ?? "Done! All mods applied successfully.");
                 }
                 else
                 {

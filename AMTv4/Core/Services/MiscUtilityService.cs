@@ -16,7 +16,6 @@ namespace ArdysaModsTools.Core.Services
                 string tempDir = Path.Combine(targetPath, "game", "_ArdysaMods", "_temp");
                 if (Directory.Exists(tempDir))
                 {
-                    log("Cleaning up temporary files...");
                     await Task.Delay(200);
                     foreach (var file in Directory.GetFiles(tempDir, "*", SearchOption.AllDirectories))
                     {
@@ -40,7 +39,7 @@ namespace ArdysaModsTools.Core.Services
             _httpClient.Timeout = TimeSpan.FromSeconds(300);
 
             // ⚠️ Tip: move token to environment variable or config file later
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Token", "_[ghp]_[5TTdtvfPVNA2g8kiAs292FcPa82IN4107pbg]");
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Token", "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");
         }
 
         public static async Task<HttpResponseMessage?> GetWithRetryAsync(string url, int maxRetries = 3)

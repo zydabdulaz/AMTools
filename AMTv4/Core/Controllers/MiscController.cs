@@ -48,7 +48,6 @@ namespace ArdysaModsTools.Core.Controllers
                 if (result.Success)
                 {
                     await _utilityService.CleanupTempFoldersAsync(targetPath, log);
-                    result.Message = "Done! All mods applied successfully."; // Assign final message
                 }
 
                 return result;
