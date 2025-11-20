@@ -2,22 +2,51 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using ArdysaModsTools.Core.Services; // assuming ConfigService lives here
 
 namespace ArdysaModsTools.Core.Services
 {
-    /// <summary>
-    /// Handles saving and restoring ComboBox selections for persistence across sessions.
-    /// Stores values in %TEMP%/vuex.log by default.
-    /// </summary>
     public static class UserSettingsService
     {
-        private static readonly string LogPath = Path.Combine(Path.GetTempPath(), "vuex.log");
+        private static string ResolveDotaPath()
+        {
+            try
+            {
+                var configService = new ConfigService();
+                string? savedPath = configService.GetLastTargetPath();
 
-        /// <summary>
-        /// Saves the selected ComboBox values to vuex.log.
-        /// </summary>
+                if (!string.IsNullOrEmpty(savedPath) && Directory.Exists(savedPath))
+                    return savedPath;
+
+                // fallback — look for game folder in exe directory
+                string fallback = AppDomain.CurrentDomain.BaseDirectory;
+                if (Directory.Exists(Path.Combine(fallback, "game")))
+                    return fallback;
+
+                return fallback;
+            }
+            catch
+            {
+                return AppDomain.CurrentDomain.BaseDirectory;
+            }
+        }
+
+        private static string JsonPath
+        {
+            get
+            {
+                string dotaPath = ResolveDotaPath();
+                string tempDir = Path.Combine(dotaPath, "game", "_ArdysaMods", "_temp");
+                return Path.Combine(tempDir, "vuex.json");
+            }
+        }
+
+        // ============================================================
+        // SAVE SELECTIONS
+        // ============================================================
         public static async Task SaveSelectionsAsync(Form form)
         {
             try
@@ -29,34 +58,42 @@ namespace ArdysaModsTools.Core.Services
                         c => c.SelectedItem?.ToString() ?? "",
                         StringComparer.OrdinalIgnoreCase);
 
-                var lines = selections.Select(kv => $"{kv.Key}={kv.Value}");
-                await File.WriteAllLinesAsync(LogPath, lines);
+                var dir = Path.GetDirectoryName(JsonPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                var json = JsonSerializer.Serialize(selections, new JsonSerializerOptions { WriteIndented = true });
+                await File.WriteAllTextAsync(JsonPath, json);
+
+                Console.WriteLine($"[INFO] Saved vuex.json to {JsonPath}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WARN] Failed to save vuex.log: {ex.Message}");
+                Console.WriteLine($"[WARN] Failed to save vuex.json: {ex.Message}");
             }
         }
 
-        /// <summary>
-        /// Restores saved ComboBox selections from vuex.log (if it exists).
-        /// Should be called after ComboBoxes are populated.
-        /// </summary>
+        // ============================================================
+        // RESTORE SELECTIONS
+        // ============================================================
         public static async Task RestoreSelectionsAsync(Form form, Action<string>? logAction = null)
         {
             try
             {
-                if (!File.Exists(LogPath))
+                if (!File.Exists(JsonPath))
                 {
                     logAction?.Invoke("No previous settings found.");
                     return;
                 }
 
-                var lines = await File.ReadAllLinesAsync(LogPath);
-                var saved = lines
-                    .Select(l => l.Split('='))
-                    .Where(p => p.Length == 2)
-                    .ToDictionary(p => p[0].Trim(), p => p[1].Trim(), StringComparer.OrdinalIgnoreCase);
+                var json = await File.ReadAllTextAsync(JsonPath);
+                var saved = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+
+                if (saved == null || saved.Count == 0)
+                {
+                    logAction?.Invoke("vuex.json empty or unreadable.");
+                    return;
+                }
 
                 foreach (var kv in saved)
                 {
@@ -66,11 +103,12 @@ namespace ArdysaModsTools.Core.Services
                     if (box != null && box.Items.Contains(kv.Value))
                         box.SelectedItem = kv.Value;
                 }
+
                 logAction?.Invoke("Restored previous settings successfully.");
             }
             catch (Exception ex)
             {
-                logAction?.Invoke($"Failed to restore vuex.log: {ex.Message}");
+                logAction?.Invoke($"Failed to restore vuex.json: {ex.Message}");
             }
         }
     }

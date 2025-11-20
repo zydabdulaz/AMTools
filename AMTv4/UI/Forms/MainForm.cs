@@ -112,6 +112,12 @@ namespace ArdysaModsTools
             EnableDetectionButtonsOnly();
         }
 
+        private void Log(string message)
+        {
+            Console.WriteLine($"[UserSettings] {message}");
+            // or append to your log TextBox if desired
+        }
+
         private async void Form1_Load(object sender, EventArgs e)
         {
             _logger.FlushBufferedLogs();

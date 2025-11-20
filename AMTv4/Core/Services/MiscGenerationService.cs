@@ -45,6 +45,7 @@ namespace ArdysaModsTools.Core.Services
             { "Overgrown Empire", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/main/models/root/Terrain/Overgrown.txt" },
             { "Sanctum of the Divine", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/main/models/root/Terrain/Sanctum.txt" },
             { "The King's New Journey", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/main/models/root/Terrain/King.txt" }
+
         };
 
         private readonly Dictionary<string, string> musicValues = new()
@@ -185,6 +186,8 @@ namespace ArdysaModsTools.Core.Services
             { "Stoneclaw Scavengers", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/refs/heads/main/models/root/Tower/Dire/Stoneclaw%20Scavengers%20Dire%20Towers.txt" },
             { "The Gaze of Scree'Auk", "https://raw.githubusercontent.com/Anneardysa/ArdysaModsTools/refs/heads/main/models/root/Tower/Dire/The%20Gaze%20of%20Scree'Auk%20-%20Dire%20Towers.txt" }
         };
+
+        
 
         // Single valid constructor
         public MiscGenerationService() { }
@@ -359,29 +362,199 @@ namespace ArdysaModsTools.Core.Services
                 await Task.Delay(1000, ct);
             }
 
-
-
             ct.ThrowIfCancellationRequested();
 
-            // MAP / TERRAIN
+            // ============================================================
+            // MAP / TERRAIN HANDLER (replacement)
+            // - LowPoly (.rar) extracts into <game>\_ArdysaMods\_temp\extraction.log
+            // - Default removes files listed in that extraction.log and restores Default.txt in items_game
+            // - Other .txt terrains still patch items_game directly
+            // ============================================================
             var selectedMap = GetSelection("Map");
             if (selectedMap != null && mapValues.TryGetValue(selectedMap, out var mapUrl))
             {
-                log("Fetching Terrain...");
-                var mapContent = await MiscUtilityService.GetStringWithRetryAsync(mapUrl);
-                if (!string.IsNullOrEmpty(mapContent))
-                {
-                    string mapPattern = @"(?s)""590""\s*\{[^}]*""prefab""\s*""terrain""[^}]*\}.*?(?=""591""|$)";
-                    if (Regex.IsMatch(content, mapPattern))
-                    {
-                        content = Regex.Replace(content, mapPattern, mapContent);
-                        log("Terrain applied.");
-                    }
-                }
-                await Task.Delay(1000, ct);
-            }
+                // pattern for terrain prefab in items_game.txt
+                string mapPattern = @"(?s)""590""\s*\{[^}]*""prefab""\s*""terrain""[^}]*\}.*?(?=""591""|$)";
 
+                // vpkPath = ".../dota 2 beta/game/_ArdysaMods/pak01_dir.vpk"
+                // Therefore vpkDir = ".../dota 2 beta/game/_ArdysaMods"
+                string vpkDir = Path.GetDirectoryName(vpkPath) ?? string.Empty;
+
+                // Correct temp folder:
+                // <game>/ _ArdysaMods / _temp
+                string gameTempDir = Path.Combine(vpkDir, "_temp");
+                Directory.CreateDirectory(gameTempDir);
+
+                // Correct log location
+                string extractionLog = Path.Combine(gameTempDir, "extraction.log");
+
+                // -------------------------
+                // CASE: Default Terrain -> restore (delete previously extracted files + write Default.txt block)
+                // -------------------------
+                if (selectedMap == "Default Terrain")
+                {
+
+                    if (File.Exists(extractionLog))
+                    {
+                        try
+                        {
+                            var lines = await File.ReadAllLinesAsync(extractionLog, ct);
+                            var filesToDelete = new HashSet<string>(lines
+                                .Select(l => l.Replace("Extracted: ", "", StringComparison.OrdinalIgnoreCase))
+                                .Where(s => !string.IsNullOrWhiteSpace(s))
+                            , StringComparer.OrdinalIgnoreCase);
+
+                            if (filesToDelete.Count > 0 && Directory.Exists(extractDir))
+                            {
+                                foreach (var f in Directory.GetFiles(extractDir, "*", SearchOption.AllDirectories))
+                                {
+                                    ct.ThrowIfCancellationRequested();
+                                    var rel = Path.GetRelativePath(extractDir, f);
+                                    if (filesToDelete.Contains(rel))
+                                    {
+                                        try { File.Delete(f); }
+                                        catch (Exception)
+                                        {
+                                        
+                                        }
+                                    }
+                                }
+
+                                // cleanup empty directories
+                                foreach (var d in Directory.GetDirectories(extractDir, "*", SearchOption.AllDirectories).Reverse())
+                                {
+                                    try
+                                    {
+                                        if (!Directory.EnumerateFileSystemEntries(d).Any())
+                                            Directory.Delete(d, true);
+                                    }
+                                    catch { /* ignore */ }
+                                }
+                            }
+                            else
+                            {
+                            }
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+                    else
+                    {
+                    }
+
+                    // restore items_game terrain block to Default.txt
+                    if (mapValues.TryGetValue("Default Terrain", out var defaultUrl))
+                    {
+                        var defaultContent = await MiscUtilityService.GetStringWithRetryAsync(defaultUrl);
+                        if (!string.IsNullOrEmpty(defaultContent) && Regex.IsMatch(content, mapPattern))
+                        {
+                            content = Regex.Replace(content, mapPattern, defaultContent);
+                        }
+                        else
+                        {
+                        }
+                    }
+
+                    await Task.Delay(1000, ct);
+                }
+                // -------------------------
+                // CASE: LowPoly Terrain -> download rar, extract TO extractDir, but write extraction.log into gameTempDir
+                // -------------------------
+                else if (selectedMap.Equals("LowPoly Terrain", StringComparison.OrdinalIgnoreCase) && mapUrl.EndsWith(".rar", StringComparison.OrdinalIgnoreCase))
+                {
+                    log("Fetching LowPoly Terrain package...");
+
+                    string rarPath = Path.Combine(gameTempDir, "LowPolyTerrain.rar");
+
+                    try
+                    {
+                        using (var response = await MiscUtilityService.GetWithRetryAsync(mapUrl))
+                        {
+                            if (response?.Content == null)
+                            {
+                                log("Download failed: empty response.");
+                                return false;
+                            }
+
+                            using (var fs = new FileStream(rarPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                            {
+                                await response.Content.CopyToAsync(fs, ct);
+                            }
+                        }
+
+                        await Task.Delay(500, ct);
+
+                        // remove any previous extraction.log so it's fresh
+                        if (File.Exists(extractionLog))
+                            File.Delete(extractionLog);
+
+                        using (var archive = RarArchive.Open(rarPath, new ReaderOptions { Password = "muvestein@98" }))
+                        {
+                            var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
+                            if (!entries.Any())
+                            {
+                                File.Delete(rarPath);
+                                return false;
+                            }
+
+                            foreach (var entry in entries)
+                            {
+                                ct.ThrowIfCancellationRequested();
+
+                                string key = entry.Key ?? string.Empty;
+                                if (string.IsNullOrWhiteSpace(key)) continue;
+
+                                string destPath = Path.Combine(extractDir, key);
+                                string? destDir = Path.GetDirectoryName(destPath);
+                                if (!string.IsNullOrEmpty(destDir))
+                                    Directory.CreateDirectory(destDir);
+
+                                entry.WriteToFile(destPath);
+
+                                // IMPORTANT: write to the gameTempDir extraction.log (same filename used by other features)
+                                await File.AppendAllTextAsync(extractionLog, $"Extracted: {key}\n", ct);
+                            }
+                        }
+
+                        // cleanup rar
+                        try { File.Delete(rarPath); } catch { }
+                    }
+                    catch (Exception)
+                    {
+                        return false;
+                    }
+
+                    await Task.Delay(1000, ct);
+                }
+                // -------------------------
+                // CASE: other terrain .txt -> patch items_game
+                // -------------------------
+                else if (!mapUrl.EndsWith(".rar", StringComparison.OrdinalIgnoreCase))
+                {
+                    log("Fetching Terrain...");
+                    var mapContent = await MiscUtilityService.GetStringWithRetryAsync(mapUrl);
+                    if (!string.IsNullOrEmpty(mapContent))
+                    {
+                        if (Regex.IsMatch(content, mapPattern))
+                        {
+                            content = Regex.Replace(content, mapPattern, mapContent);
+                            log("Terrain applied.");
+                        }
+                        else
+                        {
+                        }
+                    }
+                    else
+                    {
+                        log("Failed to download terrain.");
+                    }
+
+                    await Task.Delay(1000, ct);
+                }
+            }
             ct.ThrowIfCancellationRequested();
+
 
             // MUSIC
             var selectedMusic = GetSelection("Music");
@@ -608,7 +781,7 @@ namespace ArdysaModsTools.Core.Services
                     {
                         if (response == null)
                         {
-                            log("River resource not found (404).");
+                            log("River resource not found.");
                             // continue (not fatal)
                         }
                         else
@@ -627,7 +800,7 @@ namespace ArdysaModsTools.Core.Services
                         if (!entries.Any())
                         {
                             File.Delete(rarFilePath);
-                            log("No valid files found in River Vial archive.");
+                            log("No valid files found.");
                             return false;
                         }
 
@@ -670,7 +843,7 @@ namespace ArdysaModsTools.Core.Services
                     string extractedParticlesDir = Path.Combine(extractDir, "particles");
                     if (!Directory.Exists(extractedParticlesDir))
                     {
-                        log("Extraction failed or no valid River Vial folders found.");
+                        log("Extraction failed.");
                         return false;
                     }
                     log("River Vial applied.");
@@ -786,7 +959,7 @@ namespace ArdysaModsTools.Core.Services
                     {
                         if (response == null)
                         {
-                            log("Attack modifier resource not found.");
+                            log("Resource not found.");
                         }
                         else
                         {
@@ -803,7 +976,7 @@ namespace ArdysaModsTools.Core.Services
                         if (!entries.Any())
                         {
                             File.Delete(rarFilePath);
-                            log("No valid files found in atkModifier archive.");
+                            log("No valid files found.");
                         }
                         else
                         {
@@ -846,7 +1019,7 @@ namespace ArdysaModsTools.Core.Services
                     string particlesDir = Path.Combine(extractDir, "particles");
                     if (!Directory.Exists(kisilevDir) && !Directory.Exists(particlesDir))
                     {
-                        log("Extraction failed or no valid folders found for attack modifier.");
+                        log("Extraction failed.");
                         return false;
                     }
                     log("Attack Modifier applied.");
@@ -961,8 +1134,6 @@ namespace ArdysaModsTools.Core.Services
             return newVpk;
         }
 
-
-
         // ============================================================
         // STEP 4 — Replace (move compiled file to _ArdysaMods)
         // ============================================================
@@ -1019,7 +1190,6 @@ namespace ArdysaModsTools.Core.Services
             }
             else
             {
-                log("[Move] Failed — no new pak01_dir.vpk found.");
                 return false;
             }
 
@@ -1027,11 +1197,29 @@ namespace ArdysaModsTools.Core.Services
             {
                 if (Directory.Exists(tempRoot))
                 {
-                    Directory.Delete(tempRoot, true);
-                    log("[Move] Temporary files cleaned up.");
+
+                    // PROTECT runtime folder
+                    if (IsProtectedRuntimeFolder(tempRoot))
+                    {
+                    }
+                    else
+                    {
+                        // extra safety: ensure folder name starts with ArdysaMods_ OR is inside system temp
+                        var folderName = Path.GetFileName(tempRoot) ?? string.Empty;
+                        if (folderName.StartsWith("ArdysaMods_", StringComparison.OrdinalIgnoreCase) ||
+                            tempRoot.StartsWith(Path.GetTempPath(), StringComparison.OrdinalIgnoreCase))
+                        {
+                            Directory.Delete(tempRoot, true);
+                        }
+                        else
+                        {
+                        }
+                    }
                 }
             }
-            catch { }
+            catch (Exception)
+            {
+            }
 
             return true;
         }
@@ -1042,17 +1230,38 @@ namespace ArdysaModsTools.Core.Services
         // ============================================================
         private async Task Step_CleanupAsync(string tempRoot, Action<string> log, CancellationToken ct)
         {
-            // Step 5: log("Cleaning up temporary files...");
             try
             {
                 await Task.Delay(300, ct);
-                if (Directory.Exists(tempRoot))
-                    Directory.Delete(tempRoot, true);
-                // Step 5: log("Cleanup complete.");
+
+                if (string.IsNullOrWhiteSpace(tempRoot))
+                    return;
+
+                string full = Path.GetFullPath(tempRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+
+                if (IsProtectedRuntimeFolder(full))
+                {
+                    return;
+                }
+
+                string folderName = Path.GetFileName(full);
+
+                if (!folderName.StartsWith("ArdysaMods_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                if (Directory.Exists(full))
+                {
+                    Directory.Delete(full, true);
+                }
             }
-            catch (Exception ex)
+            catch (OperationCanceledException)
             {
-                log($"Warning: {ex.Message}"); // Step 5: log($"Cleanup warning: {ex.Message}");
+            }
+            catch (Exception)
+            {
             }
         }
 
@@ -1065,6 +1274,52 @@ namespace ArdysaModsTools.Core.Services
             proc.Start();
             await Task.WhenAll(proc.StandardOutput.ReadToEndAsync(), proc.StandardError.ReadToEndAsync());
             await proc.WaitForExitAsync(ct);
+        }
+        private bool IsProtectedRuntimeFolder(string path)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                    return false;
+
+                // Normalize path
+                string full = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                // Lowercase for simple comparisons
+                string lower = full.ToLowerInvariant();
+
+                // QUICK CHECK: look for the common combined substrings in various forms
+                if (lower.Contains(@"\.net\ardysamodstools\") || lower.Contains(@"/.net/ardysamodstools/"))
+                    return true;
+                if (lower.EndsWith(@"\.net\ardysamodstools", StringComparison.OrdinalIgnoreCase) ||
+                    lower.EndsWith(@"/.net/ardysamodstools", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                // --- Robust segment check: find ".net" followed by "ArdysaModsTools" in path segments ---
+                // Split on both separators
+                var segments = full.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries)
+                                   .Select(s => s.Trim()).ToArray();
+
+                for (int i = 0; i + 1 < segments.Length; i++)
+                {
+                    if (string.Equals(segments[i], ".net", StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(segments[i + 1], "ArdysaModsTools", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+
+                // Also protect the base ArdysaModsTools folder itself if the path contains it anywhere
+                if (segments.Any(s => string.Equals(s, "ArdysaModsTools", StringComparison.OrdinalIgnoreCase)))
+                    return true;
+
+                return false;
+            }
+            catch
+            {
+                // If anything strange happens, err on the safe side and protect
+                return true;
+            }
         }
 
         private static async Task WaitForFileReady(string path, Action<string> log, CancellationToken ct)
@@ -1082,7 +1337,6 @@ namespace ArdysaModsTools.Core.Services
                 catch (IOException) { }
                 await Task.Delay(300, ct);
             }
-            log($"File not ready after timeout: {path}");
         }
 
         private static OperationResult Fail(string msg, Action<string> log)
