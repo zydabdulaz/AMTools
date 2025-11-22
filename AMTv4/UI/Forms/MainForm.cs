@@ -27,7 +27,6 @@ namespace ArdysaModsTools
         {
             InitializeComponent();
             _logger = new Logger(mainConsoleBox);
-            _logger.Log("Ensure the 'game' folder is in the same directory as ArdysaModsTools.exe for installation to work!");
             _updater = new UpdaterService(_logger);
             _updater.OnVersionChanged += version =>
             {
@@ -361,19 +360,29 @@ namespace ArdysaModsTools
         private async void InstallButton_Click(object? sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(targetPath))
-            {
                 return;
-            }
 
             DisableAllButtons();
             progressBar.Value = 0;
 
             string appPath = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule!.FileName)!;
 
-            bool success = await _modInstaller.InstallModsAsync(targetPath, appPath);
+            // Create progress reporter that updates the UI thread
+            var progress = new Progress<int>(value =>
+            {
+                // Ensure valid range
+                int v = Math.Clamp(value, 0, 100);
+                progressBar.Value = v;
+            });
+
+            bool success = await _modInstaller.InstallModsAsync(targetPath, appPath, progress);
+
+            // Optionally set to 100 when successful
+            if (success) progressBar.Value = 100;
 
             EnableAllButtons();
         }
+
 
         private async void DisableButton_Click(object? sender, EventArgs e)
         {
