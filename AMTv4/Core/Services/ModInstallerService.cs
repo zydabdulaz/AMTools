@@ -7,6 +7,9 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ArdysaModsTools.Helpers;
+using System.IO.Compression;
+using System.Text.Json;
+using System.Threading;
 
 namespace ArdysaModsTools.Core.Services
 {
@@ -48,69 +51,238 @@ namespace ArdysaModsTools.Core.Services
             return exists;
         }
 
+        private async Task<string?> DownloadRemoteHashAsync()
+        {
+            try
+            {
+                string api = "https://raw.githubusercontent.com/Anneardysa/ModsPack/main/ModsPack.hash";
+                return await _httpClient.GetStringAsync(api);
+            }
+            catch
+            {
+                _logger.Log("Failed to fetch remote hash.");
+                return null;
+            }
+        }
+
+        private static string ComputeSHA256(string filePath)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            using var stream = File.OpenRead(filePath);
+            var hash = sha.ComputeHash(stream);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        }
+        
+
         // ------------------------------------------------------------
         //  INSTALL MODS
         // ------------------------------------------------------------
-        public async Task<bool> InstallModsAsync(string targetPath, string appPath)
+        public async Task<bool> InstallModsAsync(string targetPath, string appPath, IProgress<int>? progress = null)
         {
             _logger.Log("Installing mods...");
-            string sourceGamePath = Path.Combine(appPath, "game");
-            string copyDestination = Path.Combine(targetPath, "game");
 
-            if (!Directory.Exists(sourceGamePath))
-            {
-                _logger.Log($"Error: 'game' folder not found at '{sourceGamePath}'.");
-                MessageBox.Show($"The 'game' folder is missing at '{sourceGamePath}'. Please include it next to ArdysaModsTools.exe.",
-                    "Installation Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return false;
-            }
+            string tempRoot = Path.Combine(Path.GetTempPath(), $"ArdysaMods_Installer_{Guid.NewGuid()}");
+            Directory.CreateDirectory(tempRoot);
 
-            // Copy everything
-            FileHelper.DirectoryCopy(sourceGamePath, copyDestination, true);
+            string downloadPath = Path.Combine(tempRoot, "ModsPack.zip");
+            string extractPath = Path.Combine(tempRoot, "Extracted");
+            Directory.CreateDirectory(extractPath);
 
-            // Prepare patch files
-            string signaturesPath = Path.Combine(copyDestination, "bin", "win64", "dota.signatures");
-            string gameInfoPath = Path.Combine(copyDestination, "dota", "gameinfo_branchspecific.gi");
-
-            Directory.CreateDirectory(Path.GetDirectoryName(signaturesPath)!);
-            Directory.CreateDirectory(Path.GetDirectoryName(gameInfoPath)!);
-
-            // Download latest gameinfo
-            byte[] giData = await _httpClient.GetByteArrayAsync(GameInfoUrl);
-            await File.WriteAllBytesAsync(gameInfoPath, giData);
-
-            if (!File.Exists(signaturesPath))
-            {
-                _logger.Log("Missing 'dota.signatures' — cannot patch.");
-                return false;
-            }
-
-            // Append patch line
-            string[] lines = await File.ReadAllLinesAsync(signaturesPath);
-            int digestIndex = Array.FindIndex(lines, l => l.StartsWith("DIGEST:"));
-            if (digestIndex < 0)
-            {
-                _logger.Log("DIGEST not found in signatures.");
-                return false;
-            }
-
-            var modified = new List<string>(lines[..(digestIndex + 1)])
-            {
-                @"...\..\..\dota\gameinfo_branchspecific.gi~SHA1:1A9B91FB43FE89AD104B8001282D292EED94584D;CRC:043F604A"
-            };
-            await File.WriteAllLinesAsync(signaturesPath, modified);
-
-            // Clean extracted temp directory
-            string extractDir = Path.Combine(sourceGamePath, "_ArdysaMods", "pak01_dir");
             try
             {
-                if (Directory.Exists(extractDir))
-                    Directory.Delete(extractDir, true);
-            }
-            catch { /* ignore cleanup failure */ }
+                // 0. HASH VALIDATION
+                _logger.Log("Checking ModsPack version...");
 
-            _logger.Log("Mod installation completed successfully.");
-            return true;
+                string modsDir = Path.Combine(targetPath, "game", "_ArdysaMods");
+                Directory.CreateDirectory(modsDir);
+
+                string localHashFile = Path.Combine(modsDir, "ModsPack.hash");
+
+                string? remoteHash = await DownloadRemoteHashAsync();
+                if (!string.IsNullOrWhiteSpace(remoteHash) && File.Exists(localHashFile))
+                {
+                    string localHash = await File.ReadAllTextAsync(localHashFile);
+
+                    if (remoteHash.Trim() == localHash.Trim())
+                    {
+                        // already installed and same version
+                        var dialog = MessageBox.Show(
+                            "ModsPack already installed and up to date.\nReinstall anyway?",
+                            "Mods Installation",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question);
+
+                        if (dialog == DialogResult.No)
+                            return true; // skip installation
+                    }
+                }
+
+                // STEP 1 — Resolve ModsPack URL (or local path)
+
+                var (success, url) = await TryGetModsPackAssetUrlAsync();
+                if (!success || string.IsNullOrWhiteSpace(url))
+                {
+                    _logger.Log("Failed to locate ModsPack from server.");
+                    return false;
+                }
+
+                // STEP 2 — Download OR copy the file with progress reporting
+                _logger.Log("Downloading ModsPack...");
+
+                // If url is a rooted local path and exists, treat as local copy
+                if (Path.IsPathRooted(url) && File.Exists(url))
+                {
+                    // Copy file with progress
+                    const int bufferSize = 81920;
+                    using (var source = new FileStream(url, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    using (var dest = new FileStream(downloadPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        long total = source.Length;
+                        long read = 0;
+                        var buffer = new byte[bufferSize];
+                        int bytesRead;
+                        int lastReported = -1;
+
+                        while ((bytesRead = await source.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                        {
+                            await dest.WriteAsync(buffer, 0, bytesRead);
+                            read += bytesRead;
+
+                            if (total > 0 && progress != null)
+                            {
+                                int pct = (int)(read * 100L / total);
+                                if (pct != lastReported)
+                                {
+                                    lastReported = pct;
+                                    progress.Report(pct);
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // HTTP download with progress
+                    using (var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            _logger.Log($"Download failed: {response.StatusCode}");
+                            return false;
+                        }
+
+                        long? total = response.Content.Headers.ContentLength;
+                        using (var netStream = await response.Content.ReadAsStreamAsync())
+                        using (var fileStream = new FileStream(downloadPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            const int bufferSize = 81920;
+                            var buffer = new byte[bufferSize];
+                            long totalRead = 0;
+                            int bytesRead;
+                            int lastReported = -1;
+
+                            while ((bytesRead = await netStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await fileStream.WriteAsync(buffer, 0, bytesRead);
+                                totalRead += bytesRead;
+
+                                if (total.HasValue && progress != null)
+                                {
+                                    int pct = (int)(totalRead * 100L / total.Value);
+                                    if (pct != lastReported)
+                                    {
+                                        lastReported = pct;
+                                        progress.Report(pct);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Ensure 100% reported after download
+                progress?.Report(100);
+
+                // STEP 3 — Extract ModsPack into temporary directory
+                try
+                {
+                    // If the ZIP is bad, ZipFile.ExtractToDirectory throws
+                    ZipFile.ExtractToDirectory(downloadPath, extractPath);
+                }
+                catch (Exception)
+                {
+                    _logger.Log($"ERROR 08"); // Failed to extract ModsPack: {ex.Message}
+                    return false;
+                }
+
+                if (!string.IsNullOrWhiteSpace(remoteHash))
+                {
+                    await File.WriteAllTextAsync(localHashFile, remoteHash.Trim());
+                }
+
+                // STEP 4 — Copy extracted contents into game/_ArdysaMods
+                Directory.CreateDirectory(modsDir);
+
+                foreach (string dir in Directory.GetDirectories(extractPath, "*", SearchOption.AllDirectories))
+                {
+                    string rel = Path.GetRelativePath(extractPath, dir);
+                    string dest = Path.Combine(modsDir, rel);
+                    Directory.CreateDirectory(dest);
+                }
+
+                foreach (string file in Directory.GetFiles(extractPath, "*", SearchOption.AllDirectories))
+                {
+                    string rel = Path.GetRelativePath(extractPath, file);
+                    string dest = Path.Combine(modsDir, rel);
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                    File.Copy(file, dest, true);
+                }
+
+                // STEP 5 — Patch dota.signatures and gameinfo_branchspecific.gi (unchanged)
+
+                string signaturesPath = Path.Combine(targetPath, "game", "bin", "win64", "dota.signatures");
+                string gameInfoPath = Path.Combine(targetPath, "game", "dota", "gameinfo_branchspecific.gi");
+
+                if (!File.Exists(signaturesPath))
+                {
+                    _logger.Log("Missing dota.signatures");
+                    return false;
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(gameInfoPath)!);
+
+                // Download clean gameinfo
+                byte[] giData = await _httpClient.GetByteArrayAsync(GameInfoUrl);
+                await File.WriteAllBytesAsync(gameInfoPath, giData);
+
+                var lines = await File.ReadAllLinesAsync(signaturesPath);
+                int digestIndex = Array.FindIndex(lines, l => l.StartsWith("DIGEST:", StringComparison.Ordinal));
+                if (digestIndex < 0)
+                {
+                    _logger.Log("DIGEST not found inside signatures.");
+                    return false;
+                }
+
+                var modified = new List<string>(lines[..(digestIndex + 1)])
+                    {
+                        @"...\..\..\dota\gameinfo_branchspecific.gi~SHA1:1A9B91FB43FE89AD104B8001282D292EED94584D;CRC:043F604A"
+                    };
+
+                await File.WriteAllLinesAsync(signaturesPath, modified);
+
+                _logger.Log("Mod installation completed successfully.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Log($"Installation failed: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); }
+                catch { }
+            }
         }
 
         // ------------------------------------------------------------
@@ -124,7 +296,6 @@ namespace ArdysaModsTools.Core.Services
 
             if (!File.Exists(signaturesPath))
             {
-                _logger.Log("No signatures file found — mods may already be disabled.");
                 return true;
             }
 
@@ -184,65 +355,34 @@ namespace ArdysaModsTools.Core.Services
         // ------------------------------------------------------------
         //  PRIVATE HELPERS
         // ------------------------------------------------------------
-        private bool ExtractAndValidateVPK(string sourceGamePath)
+
+        private async Task<(bool Success, string Url)> TryGetModsPackAssetUrlAsync()
         {
-            string vpkPath = Path.Combine(sourceGamePath, "_ArdysaMods", "pak01_dir.vpk");
-            string extractDir = Path.Combine(sourceGamePath, "_ArdysaMods", "pak01_dir");
-            string hlExtractPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "HLExtract.exe");
-            string validationFile = Path.Combine(extractDir, "root", "version", "_ArdysaMods");
-
-            if (!File.Exists(vpkPath))
-            {
-                _logger.Log($"Missing 'pak01_dir.vpk' at '{vpkPath}'.");
-                return false;
-            }
-
-            if (!File.Exists(hlExtractPath))
-            {
-                _logger.Log("Missing 'HLExtract.exe'.");
-                return false;
-            }
-
             try
             {
-                if (Directory.Exists(extractDir))
-                    Directory.Delete(extractDir, true);
-                Directory.CreateDirectory(extractDir);
+                string api = "https://api.github.com/repos/Anneardysa/ModsPack/releases/tags/mods-v1.0";
+                var response = await _httpClient.GetAsync(api);
+                response.EnsureSuccessStatusCode();
 
-                var psi = new ProcessStartInfo
+                using var stream = await response.Content.ReadAsStreamAsync();
+                using var json = await JsonDocument.ParseAsync(stream);
+
+                foreach (var asset in json.RootElement.GetProperty("assets").EnumerateArray())
                 {
-                    FileName = hlExtractPath,
-                    Arguments = $"-p \"{vpkPath}\" -d \"{extractDir}\" -e \"root\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                using var proc = new Process { StartInfo = psi };
-                proc.Start();
-                string output = proc.StandardOutput.ReadToEnd();
-                string error = proc.StandardError.ReadToEnd();
-                proc.WaitForExit();
-
-                if (proc.ExitCode != 0)
-                {
-                    _logger.Log($"HLExtract failed: {error}");
-                    return false;
+                    var name = asset.GetProperty("name").GetString() ?? "";
+                    if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string url = asset.GetProperty("browser_download_url").GetString() ?? "";
+                        if (!string.IsNullOrEmpty(url))
+                            return (true, url);
+                    }
                 }
 
-                if (!File.Exists(validationFile))
-                {
-                    _logger.Log("Missing validation file inside extracted VPK.");
-                    return false;
-                }
-
-                return true;
+                return (false, "");
             }
-            catch (Exception ex)
+            catch
             {
-                _logger.Log($"VPK extraction failed: {ex.Message}");
-                return false;
+                return (false, "");
             }
         }
 

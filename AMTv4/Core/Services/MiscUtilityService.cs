@@ -39,7 +39,7 @@ namespace ArdysaModsTools.Core.Services
             _httpClient.Timeout = TimeSpan.FromSeconds(300);
 
             // ⚠️ Tip: move token to environment variable or config file later
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Token", "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");
+            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Token", "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");
         }
 
         public static async Task<HttpResponseMessage?> GetWithRetryAsync(string url, int maxRetries = 3)

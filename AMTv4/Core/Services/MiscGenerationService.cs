@@ -311,7 +311,7 @@ namespace ArdysaModsTools.Core.Services
             string itemsGamePath = Path.Combine(extractDir, "scripts", "items", "items_game.txt");
             if (!File.Exists(itemsGamePath))
             {
-                log("items_game.txt not found.");
+                log("core not found.");
                 return false;
             }
 
@@ -326,233 +326,36 @@ namespace ArdysaModsTools.Core.Services
                 var weatherContent = await MiscUtilityService.GetStringWithRetryAsync(weatherUrl);
                 if (!string.IsNullOrEmpty(weatherContent))
                 {
-                    // Match exactly the block between "555" and the next quote-number ("556")
-                    string weatherPattern = @"(?s)""555""\s*\{.*?\}\s*(?=""556"")";
-
-                    // Test match existence first
-                    var match = Regex.Match(content, weatherPattern);
-                    if (match.Success)
+                    string weatherPattern = @"(?s)""555""\s*\{[^}]*""prefab""\s*""weather""[^}]*\}.*?(?=""556""|$)";
+                    if (Regex.IsMatch(content, weatherPattern))
                     {
-                        content = Regex.Replace(content, weatherPattern, weatherContent, RegexOptions.Singleline);
+                        content = Regex.Replace(content, weatherPattern, weatherContent);
                         log("Weather applied.");
                     }
-                    else
-                    {
-                        log("Weather pattern not found. Trying fallback...");
-
-                        // fallback — find any block with prefab "weather"
-                        string fallbackPattern = @"(?s)""\d+""\s*\{[^}]*""prefab""\s*""weather""[^}]*\}";
-
-                        if (Regex.IsMatch(content, fallbackPattern))
-                        {
-                            content = Regex.Replace(content, fallbackPattern, weatherContent, RegexOptions.Singleline);
-                            log("Weather applied (fallback).");
-                        }
-                        else
-                        {
-                            log("Weather block not found at all in items_game.txt");
-                        }
-                    }
                 }
-                else
-                {
-                    log("❌ Weather content empty or failed to fetch from URL.");
-                }
-
                 await Task.Delay(1000, ct);
             }
-
+            
             ct.ThrowIfCancellationRequested();
 
-            // ============================================================
-            // MAP / TERRAIN HANDLER (replacement)
-            // - LowPoly (.rar) extracts into <game>\_ArdysaMods\_temp\extraction.log
-            // - Default removes files listed in that extraction.log and restores Default.txt in items_game
-            // - Other .txt terrains still patch items_game directly
-            // ============================================================
+            // TERRAIN
             var selectedMap = GetSelection("Map");
             if (selectedMap != null && mapValues.TryGetValue(selectedMap, out var mapUrl))
             {
-                // pattern for terrain prefab in items_game.txt
-                string mapPattern = @"(?s)""590""\s*\{[^}]*""prefab""\s*""terrain""[^}]*\}.*?(?=""591""|$)";
-
-                // vpkPath = ".../dota 2 beta/game/_ArdysaMods/pak01_dir.vpk"
-                // Therefore vpkDir = ".../dota 2 beta/game/_ArdysaMods"
-                string vpkDir = Path.GetDirectoryName(vpkPath) ?? string.Empty;
-
-                // Correct temp folder:
-                // <game>/ _ArdysaMods / _temp
-                string gameTempDir = Path.Combine(vpkDir, "_temp");
-                Directory.CreateDirectory(gameTempDir);
-
-                // Correct log location
-                string extractionLog = Path.Combine(gameTempDir, "extraction.log");
-
-                // -------------------------
-                // CASE: Default Terrain -> restore (delete previously extracted files + write Default.txt block)
-                // -------------------------
-                if (selectedMap == "Default Terrain")
+                log("Fetching Terrain...");
+                var mapContent = await MiscUtilityService.GetStringWithRetryAsync(mapUrl);
+                if (!string.IsNullOrEmpty(mapContent))
                 {
-
-                    if (File.Exists(extractionLog))
+                    string mapPattern = @"(?s)""590""\s*\{[^}]*""prefab""\s*""terrain""[^}]*\}.*?(?=""591""|$)";
+                    if (Regex.IsMatch(content, mapPattern))
                     {
-                        try
-                        {
-                            var lines = await File.ReadAllLinesAsync(extractionLog, ct);
-                            var filesToDelete = new HashSet<string>(lines
-                                .Select(l => l.Replace("Extracted: ", "", StringComparison.OrdinalIgnoreCase))
-                                .Where(s => !string.IsNullOrWhiteSpace(s))
-                            , StringComparer.OrdinalIgnoreCase);
-
-                            if (filesToDelete.Count > 0 && Directory.Exists(extractDir))
-                            {
-                                foreach (var f in Directory.GetFiles(extractDir, "*", SearchOption.AllDirectories))
-                                {
-                                    ct.ThrowIfCancellationRequested();
-                                    var rel = Path.GetRelativePath(extractDir, f);
-                                    if (filesToDelete.Contains(rel))
-                                    {
-                                        try { File.Delete(f); }
-                                        catch (Exception)
-                                        {
-                                        
-                                        }
-                                    }
-                                }
-
-                                // cleanup empty directories
-                                foreach (var d in Directory.GetDirectories(extractDir, "*", SearchOption.AllDirectories).Reverse())
-                                {
-                                    try
-                                    {
-                                        if (!Directory.EnumerateFileSystemEntries(d).Any())
-                                            Directory.Delete(d, true);
-                                    }
-                                    catch { /* ignore */ }
-                                }
-                            }
-                            else
-                            {
-                            }
-                        }
-                        catch (Exception)
-                        {
-                        }
+                        content = Regex.Replace(content, mapPattern, mapContent);
+                        log("Terrain applied.");
                     }
-                    else
-                    {
-                    }
-
-                    // restore items_game terrain block to Default.txt
-                    if (mapValues.TryGetValue("Default Terrain", out var defaultUrl))
-                    {
-                        var defaultContent = await MiscUtilityService.GetStringWithRetryAsync(defaultUrl);
-                        if (!string.IsNullOrEmpty(defaultContent) && Regex.IsMatch(content, mapPattern))
-                        {
-                            content = Regex.Replace(content, mapPattern, defaultContent);
-                        }
-                        else
-                        {
-                        }
-                    }
-
-                    await Task.Delay(1000, ct);
                 }
-                // -------------------------
-                // CASE: LowPoly Terrain -> download rar, extract TO extractDir, but write extraction.log into gameTempDir
-                // -------------------------
-                else if (selectedMap.Equals("LowPoly Terrain", StringComparison.OrdinalIgnoreCase) && mapUrl.EndsWith(".rar", StringComparison.OrdinalIgnoreCase))
-                {
-                    log("Fetching LowPoly Terrain package...");
-
-                    string rarPath = Path.Combine(gameTempDir, "LowPolyTerrain.rar");
-
-                    try
-                    {
-                        using (var response = await MiscUtilityService.GetWithRetryAsync(mapUrl))
-                        {
-                            if (response?.Content == null)
-                            {
-                                log("Download failed: empty response.");
-                                return false;
-                            }
-
-                            using (var fs = new FileStream(rarPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                            {
-                                await response.Content.CopyToAsync(fs, ct);
-                            }
-                        }
-
-                        await Task.Delay(500, ct);
-
-                        // remove any previous extraction.log so it's fresh
-                        if (File.Exists(extractionLog))
-                            File.Delete(extractionLog);
-
-                        using (var archive = RarArchive.Open(rarPath, new ReaderOptions { Password = "muvestein@98" }))
-                        {
-                            var entries = archive.Entries.Where(e => !e.IsDirectory).ToList();
-                            if (!entries.Any())
-                            {
-                                File.Delete(rarPath);
-                                return false;
-                            }
-
-                            foreach (var entry in entries)
-                            {
-                                ct.ThrowIfCancellationRequested();
-
-                                string key = entry.Key ?? string.Empty;
-                                if (string.IsNullOrWhiteSpace(key)) continue;
-
-                                string destPath = Path.Combine(extractDir, key);
-                                string? destDir = Path.GetDirectoryName(destPath);
-                                if (!string.IsNullOrEmpty(destDir))
-                                    Directory.CreateDirectory(destDir);
-
-                                entry.WriteToFile(destPath);
-
-                                // IMPORTANT: write to the gameTempDir extraction.log (same filename used by other features)
-                                await File.AppendAllTextAsync(extractionLog, $"Extracted: {key}\n", ct);
-                            }
-                        }
-
-                        // cleanup rar
-                        try { File.Delete(rarPath); } catch { }
-                    }
-                    catch (Exception)
-                    {
-                        return false;
-                    }
-
-                    await Task.Delay(1000, ct);
-                }
-                // -------------------------
-                // CASE: other terrain .txt -> patch items_game
-                // -------------------------
-                else if (!mapUrl.EndsWith(".rar", StringComparison.OrdinalIgnoreCase))
-                {
-                    log("Fetching Terrain...");
-                    var mapContent = await MiscUtilityService.GetStringWithRetryAsync(mapUrl);
-                    if (!string.IsNullOrEmpty(mapContent))
-                    {
-                        if (Regex.IsMatch(content, mapPattern))
-                        {
-                            content = Regex.Replace(content, mapPattern, mapContent);
-                            log("Terrain applied.");
-                        }
-                        else
-                        {
-                        }
-                    }
-                    else
-                    {
-                        log("Failed to download terrain.");
-                    }
-
-                    await Task.Delay(1000, ct);
-                }
+                await Task.Delay(1000, ct);
             }
+            
             ct.ThrowIfCancellationRequested();
 
 
